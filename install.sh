@@ -50,5 +50,13 @@ else
   lemonade pull "$MODEL"
 fi
 
+if pgrep -af whisper-server 2>/dev/null | grep -q -- '--vad'; then
+  say "Silero voice detection is on"
+else
+  say ""
+  say "Recommended: turn on Silero voice detection so silence isn't transcribed as \"Thank you.\""
+  say "See 'Stop invented text in silence' in https://github.com/jflaflamme/whispering#readme"
+fi
+
 say ""
 say "Done. Run:  whispering        (Ctrl+C to stop, transcripts go to ~/transcripts/)"

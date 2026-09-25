@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stand-in for parec in tests: streams $WHISPERING_TEST_WAV in real time as
+# 16 kHz mono s16le, then silence. Never touches PipeWire or the call audio.
+exec ffmpeg -loglevel error -re -i "$WHISPERING_TEST_WAV" -af apad -ar 16000 -ac 1 -f s16le -

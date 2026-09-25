@@ -97,7 +97,7 @@ class Screen:
         self._draw_footer()
 
 
-async def run_stream(name, source, ws_url, screen, gain):
+async def run_stream(name, source, ws_url, screen, gain, turn_detection):
     proc = await asyncio.create_subprocess_exec(
         "parec", "-d", source, "--format=s16le", f"--rate={RATE}", "--channels=1",
         "--latency-msec=50", "--raw",
@@ -105,6 +105,10 @@ async def run_stream(name, source, ws_url, screen, gain):
     )
     try:
         async with websockets.connect(ws_url, max_size=None) as ws:
+            if turn_detection:
+                await ws.send(json.dumps({"type": "session.update",
+                                          "session": {"turn_detection": turn_detection}}))
+
             async def send():
                 while chunk := await proc.stdout.readexactly(CHUNK_BYTES):
                     if gain != 1.0:
@@ -156,6 +160,10 @@ def main():
                    "(default: ~/transcripts/YYYY-MM-DD_HHMM.txt)")
     p.add_argument("--no-save", action="store_true", help="do not write a transcript file")
     p.add_argument("--mic-gain", type=float, default=1.0, help="multiply mic samples (e.g. 2.0)")
+    p.add_argument("--pause", type=float, metavar="SEC",
+                   help="silence that ends a line (Lemonade default 0.8)")
+    p.add_argument("--threshold", type=float,
+                   help="loudness that counts as speech (Lemonade default 0.01); raise if silence produces text")
     p.add_argument("--list", action="store_true", help="list available sources and exit")
     a = p.parse_args()
 
@@ -183,6 +191,12 @@ def main():
     host = a.server.split("//", 1)[1].split("/", 1)[0].split(":")[0]
     ws_url = f"ws://{host}:{ws_port}/realtime?model={a.model}"
 
+    turn_detection = {}
+    if a.pause is not None:
+        turn_detection["silence_duration_ms"] = int(a.pause * 1000)
+    if a.threshold is not None:
+        turn_detection["threshold"] = a.threshold
+
     log = None
     if not a.no_save:
         path = os.path.expanduser(a.log or f"~/transcripts/{dt.datetime.now():%Y-%m-%d_%H%M}.txt")
@@ -194,10 +208,12 @@ def main():
     for name, src in streams.items():
         screen.info(f"{name}: {src}")
     screen.info(f"model {a.model}, Ctrl+C to stop")
+    if turn_detection:
+        screen.info(f"turn detection: {turn_detection}")
 
     async def go():
         await asyncio.gather(*(
-            run_stream(n, s, ws_url, screen, a.mic_gain if n == "mic" else 1.0)
+            run_stream(n, s, ws_url, screen, a.mic_gain if n == "mic" else 1.0, turn_detection)
             for n, s in streams.items()
         ))
 
