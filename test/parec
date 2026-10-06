@@ -1,4 +1,13 @@
 #!/bin/sh
-# Stand-in for parec in tests: streams $WHISPERING_TEST_WAV in real time as
-# 16 kHz mono s16le, then silence. Never touches PipeWire or the call audio.
-exec ffmpeg -loglevel error -re -i "$WHISPERING_TEST_WAV" -af apad -ar 16000 -ac 1 -f s16le -
+# Stand-in for parec in tests: streams a WAV in real time as 16 kHz mono
+# s16le, then silence. Never touches PipeWire or the call audio.
+# WHISPERING_TEST_WAV: the file for every source.
+# WHISPERING_TEST_DIR: a folder with one <source>.wav per source (e.g. mic.wav, spk.wav).
+src=""
+while [ $# -gt 0 ]; do
+  [ "$1" = "-d" ] && src="$2"
+  shift
+done
+wav="$WHISPERING_TEST_WAV"
+[ -n "$WHISPERING_TEST_DIR" ] && wav="$WHISPERING_TEST_DIR/$src.wav"
+exec ffmpeg -loglevel error -re -i "$wav" -af apad -ar 16000 -ac 1 -f s16le -

@@ -48,6 +48,7 @@ whispering --mic-gain 2      # boost a quiet mic
 whispering --pause 1.5       # longer pause before a line ends (default 0.8 s)
 whispering --threshold 0.03  # louder sound needed to count as speech (default 0.01)
 whispering --language km     # Khmer, with a local Khmer model (see below)
+whispering --spk-language km # you in English, the other side in Khmer
 ```
 
 - Finished lines scroll with a timestamp, `mic` in cyan and `spk` in yellow. The grey lines at the bottom show text still being recognised. A line is finalised when the speaker pauses for 0.8 s (change with `--pause`).
@@ -70,7 +71,8 @@ This switches both streams to a local Khmer model, [whisper-turbo-khmer-v9](http
 - **Accuracy:** on 100 random clips of the FLEURS Khmer test set, about **13% of characters wrong**, against 90 to 102% for Lemonade's Whisper. FLEURS is clearly read speech; real calls (fillers, overlapping voices, phone audio) come out noticeably worse, and names and English words inside Khmer speech are often mangled.
 - **Speed:** about 4 to 5 times faster than real time on a Ryzen AI Max laptop (16 cores). Slower CPUs may fall behind on long calls; `--threads N` on `khmer_server.py` sets the core count.
 - **Model location:** the model downloads to the Hugging Face cache. To use a copy already on disk: `WHISPERING_KM_MODEL=/path/to/whisper-turbo-khmer-v9 whispering --language km`.
-- **One language per run:** with `--language km` both sides are treated as Khmer. For English calls, run without it.
+- **One language per side:** each side uses one engine for the whole run. When you speak English and the other side speaks Khmer, use `whispering --spk-language km` (your mic stays on Lemonade's Whisper). `--mic-language km` does the opposite, and `--language km` makes both sides Khmer.
+- **Mixed speech is not handled:** the Khmer model writes English words in Khmer letters, and Lemonade's Whisper turns Khmer into invented English. A sentence that switches language comes out wrong on either engine.
 
 ### Testing the Khmer branch
 

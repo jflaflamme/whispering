@@ -287,7 +287,11 @@ def main():
     p.add_argument("--threshold", type=float,
                    help="loudness that counts as speech (Lemonade default 0.01); raise if silence produces text")
     p.add_argument("--language", choices=["auto", "km"], default="auto",
-                   help="km: transcribe Khmer with a local Khmer model instead of Lemonade's Whisper")
+                   help="auto: Lemonade's Whisper (English and most languages); km: a local Khmer model")
+    p.add_argument("--mic-language", choices=["auto", "km"],
+                   help="language for the mic only (default: --language)")
+    p.add_argument("--spk-language", choices=["auto", "km"],
+                   help="language for the other side only (default: --language)")
     p.add_argument("--km-model", default=os.environ.get("WHISPERING_KM_MODEL", KM_MODEL),
                    help="Khmer model id or local path (env WHISPERING_KM_MODEL)")
     p.add_argument("--list", action="store_true", help="list available sources and exit")
@@ -297,34 +301,40 @@ def main():
         subprocess.run(["pactl", "list", "short", "sources"])
         return
 
-    streams = {}
+    streams = {}  # name -> (source, language)
     if not a.no_mic:
-        streams["mic"] = a.mic
+        streams["mic"] = (a.mic, a.mic_language or a.language)
     if not a.no_spk:
-        streams["spk"] = a.spk
+        streams["spk"] = (a.spk, a.spk_language or a.language)
     if not streams:
         sys.exit("nothing to transcribe")
+    langs = {lang for _, lang in streams.values()}
 
-    if a.language == "km":
-        return main_km(a, streams)
+    ws_url = None
+    if "auto" in langs:
+        try:
+            health = http_json(f"{a.server}/health", timeout=5)
+        except Exception as e:
+            sys.exit(f"Lemonade not reachable at {a.server}: {e}")
+        loaded = [m.get("model_name") for m in health.get("all_models_loaded", [])]
+        if a.model not in loaded:
+            print(f"# loading {a.model}…", flush=True)
+            http_json(f"{a.server}/load", {"model_name": a.model})
+        ws_port = health.get("websocket_port", 9000)
+        host = a.server.split("//", 1)[1].split("/", 1)[0].split(":")[0]
+        ws_url = f"ws://{host}:{ws_port}/realtime?model={a.model}"
 
-    try:
-        health = http_json(f"{a.server}/health", timeout=5)
-    except Exception as e:
-        sys.exit(f"Lemonade not reachable at {a.server}: {e}")
-    loaded = [m.get("model_name") for m in health.get("all_models_loaded", [])]
-    if a.model not in loaded:
-        print(f"# loading {a.model}…", flush=True)
-        http_json(f"{a.server}/load", {"model_name": a.model})
-    ws_port = health.get("websocket_port", 9000)
-    host = a.server.split("//", 1)[1].split("/", 1)[0].split(":")[0]
-    ws_url = f"ws://{host}:{ws_port}/realtime?model={a.model}"
+    km_url = server = None
+    if "km" in langs:
+        km_url, server = start_khmer_server(a.km_model)
 
     turn_detection = {}
     if a.pause is not None:
         turn_detection["silence_duration_ms"] = int(a.pause * 1000)
     if a.threshold is not None:
         turn_detection["threshold"] = a.threshold
+    pause = a.pause if a.pause is not None else 0.8
+    threshold = a.threshold if a.threshold is not None else 0.01
 
     log = None
     if not a.no_save:
@@ -334,17 +344,22 @@ def main():
     screen = Screen(list(streams), log)
     if log:
         screen.info(f"saving to {log.name}")
-    for name, src in streams.items():
-        screen.info(f"{name}: {src}")
-    screen.info(f"model {a.model}, Ctrl+C to stop")
+    for name, (src, lang) in streams.items():
+        engine = f"Khmer model {a.km_model} (local, CPU)" if lang == "km" else f"Lemonade {a.model}"
+        screen.info(f"{name}: {src} -> {engine}")
     if turn_detection:
         screen.info(f"turn detection: {turn_detection}")
+    screen.info("Ctrl+C to stop")
 
     async def go():
-        await asyncio.gather(*(
-            run_stream(n, s, ws_url, screen, a.mic_gain if n == "mic" else 1.0, turn_detection)
-            for n, s in streams.items()
-        ))
+        tasks = []
+        for n, (src, lang) in streams.items():
+            gain = a.mic_gain if n == "mic" else 1.0
+            if lang == "km":
+                tasks.append(run_stream_km(n, src, km_url, screen, gain, pause, threshold))
+            else:
+                tasks.append(run_stream(n, src, ws_url, screen, gain, turn_detection))
+        await asyncio.gather(*tasks)
 
     try:
         asyncio.run(go())
@@ -352,42 +367,6 @@ def main():
         pass
     finally:
         screen.flush_partials()
-        if log:
-            log.close()
-        print()
-
-
-def open_log(a):
-    if a.no_save:
-        return None
-    path = os.path.expanduser(a.log or f"~/transcripts/{dt.datetime.now():%Y-%m-%d_%H%M}.txt")
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    return open(path, "a")
-
-
-def main_km(a, streams):
-    km_url, server = start_khmer_server(a.km_model)
-    log = open_log(a)
-    screen = Screen(list(streams), log)
-    if log:
-        screen.info(f"saving to {log.name}")
-    for name, src in streams.items():
-        screen.info(f"{name}: {src}")
-    pause = a.pause if a.pause is not None else 0.8
-    threshold = a.threshold if a.threshold is not None else 0.01
-    screen.info(f"Khmer model {a.km_model} (local, CPU), pause {pause}s, Ctrl+C to stop")
-
-    async def go():
-        await asyncio.gather(*(
-            run_stream_km(n, s, km_url, screen, a.mic_gain if n == "mic" else 1.0, pause, threshold)
-            for n, s in streams.items()
-        ))
-
-    try:
-        asyncio.run(go())
-    except KeyboardInterrupt:
-        pass
-    finally:
         for name, pcm, cut in KM_PENDING:
             screen.status(name, "(finishing…)")
             try:
