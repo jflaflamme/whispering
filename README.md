@@ -47,12 +47,46 @@ whispering -m Whisper-Tiny   # faster, less accurate
 whispering --mic-gain 2      # boost a quiet mic
 whispering --pause 1.5       # longer pause before a line ends (default 0.8 s)
 whispering --threshold 0.03  # louder sound needed to count as speech (default 0.01)
+whispering --language km     # Khmer, with a local Khmer model (see below)
 ```
 
 - Finished lines scroll with a timestamp, `mic` in cyan and `spk` in yellow. The grey lines at the bottom show text still being recognised. A line is finalised when the speaker pauses for 0.8 s (change with `--pause`).
 - Every finished line is saved as it happens to `~/transcripts/YYYY-MM-DD_HHMM.txt` (format `HH:MM:SS [mic|spk] text`). The path is printed at startup.
 - Press Ctrl+C to stop. An unfinished sentence is saved with `[cut]` on the end.
 - Default devices are read at startup: restart after switching headset or output.
+
+## Khmer
+
+Lemonade's Whisper cannot transcribe Khmer: it answers with invented English, or with mixed scripts when Khmer is forced. For Khmer calls, use:
+
+```sh
+whispering --language km
+```
+
+This switches both streams to a local Khmer model, [whisper-turbo-khmer-v9](https://huggingface.co/1morecupofhottea/whisper-turbo-khmer-v9) (MIT), a fine-tune of Whisper large-v3-turbo. It runs on the CPU in a small helper, `khmer_server.py`, which `whispering` starts on its own and stops when you quit. Nothing leaves the laptop. Lemonade is not used in this mode.
+
+- **First run:** downloads PyTorch (CPU) and the model, about 2 GB in total, so allow a few minutes. Later starts take a few seconds.
+- **Lines:** `whispering` cuts the audio at pauses (0.8 s, change with `--pause`) and sends each piece to the model. There is no live grey preview in this mode; the footer shows `(speaking…)` and `(transcribing…)` instead. Pieces with no voice are dropped, so silence does not produce text.
+- **Accuracy:** on 100 random clips of the FLEURS Khmer test set, about **13% of characters wrong**, against 90 to 102% for Lemonade's Whisper. FLEURS is clearly read speech; real calls (fillers, overlapping voices, phone audio) come out noticeably worse, and names and English words inside Khmer speech are often mangled.
+- **Speed:** about 4 to 5 times faster than real time on a Ryzen AI Max laptop (16 cores). Slower CPUs may fall behind on long calls; `--threads N` on `khmer_server.py` sets the core count.
+- **Model location:** the model downloads to the Hugging Face cache. To use a copy already on disk: `WHISPERING_KM_MODEL=/path/to/whisper-turbo-khmer-v9 whispering --language km`.
+- **One language per run:** with `--language km` both sides are treated as Khmer. For English calls, run without it.
+
+### Testing the Khmer branch
+
+Khmer support is on the `khmer` branch until it has been tested. Either install from the branch:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jflaflamme/whispering/khmer/install.sh | WHISPERING_BRANCH=khmer sh
+```
+
+or run it from a checkout:
+
+```sh
+git clone https://github.com/jflaflamme/whispering && cd whispering
+git checkout khmer        # or: git pull, on an existing checkout
+./whispering.py --language km
+```
 
 ## Stop invented text in silence (recommended)
 

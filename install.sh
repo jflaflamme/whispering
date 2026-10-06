@@ -1,9 +1,12 @@
 #!/bin/sh
 # Install whispering: live mic + speaker transcription via a local Lemonade server.
 #   curl -fsSL https://raw.githubusercontent.com/jflaflamme/whispering/main/install.sh | sh
+# A test branch: curl -fsSL .../whispering/<branch>/install.sh | WHISPERING_BRANCH=<branch> sh
 set -eu
 
-REPO_RAW="${WHISPERING_RAW:-https://raw.githubusercontent.com/jflaflamme/whispering/main}"
+BRANCH="${WHISPERING_BRANCH:-main}"
+REPO_RAW="${WHISPERING_RAW:-https://raw.githubusercontent.com/jflaflamme/whispering/$BRANCH}"
+SHARE_DIR="${SHARE_DIR:-$HOME/.local/share/whispering}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 MODEL="Whisper-Large-v3-Turbo"
 SERVER="http://localhost:13305/api/v1"
@@ -15,6 +18,9 @@ mkdir -p "$BIN_DIR"
 say "Installing whispering to $BIN_DIR/whispering"
 curl -fsSL "$REPO_RAW/whispering.py" -o "$BIN_DIR/whispering"
 chmod +x "$BIN_DIR/whispering"
+mkdir -p "$SHARE_DIR"
+curl -fsSL "$REPO_RAW/khmer_server.py" -o "$SHARE_DIR/khmer_server.py"
+chmod +x "$SHARE_DIR/khmer_server.py"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
@@ -60,3 +66,4 @@ fi
 
 say ""
 say "Done. Run:  whispering        (Ctrl+C to stop, transcripts go to ~/transcripts/)"
+say "Khmer:     whispering --language km   (first run downloads the Khmer model, about 2 GB)"

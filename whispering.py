@@ -11,15 +11,20 @@ WebSocket session. Final lines scroll; partial text sits in a live footer.
 """
 
 import argparse
+import array
 import asyncio
 import base64
+import collections
 import datetime as dt
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
+from pathlib import Path
 
 import websockets
 
@@ -28,6 +33,11 @@ CHUNK_BYTES = RATE * 2 // 10  # 100 ms of s16le mono
 
 COLORS = {"mic": "\033[1;36m", "spk": "\033[1;33m"}
 RESET, DIM = "\033[0m", "\033[2m"
+
+KM_MODEL = "1morecupofhottea/whisper-turbo-khmer-v9"
+KM_PORT = 13399
+KM_MAX_SECONDS = 25  # cut long unbroken speech so the model stays under its 30 s window
+KM_PENDING = []  # (stream, pcm, cut) left over at Ctrl+C, transcribed before exit
 
 
 def default_sources():
@@ -50,6 +60,7 @@ class Screen:
     def __init__(self, streams, log):
         self.streams = streams
         self.partial = {s: "" for s in streams}
+        self.hint = {s: "" for s in streams}
         self.log = log
         self.drawn = 0
 
@@ -61,7 +72,7 @@ class Screen:
     def _draw_footer(self):
         width = shutil.get_terminal_size().columns
         for s in self.streams:
-            text = self.partial[s]
+            text = self.partial[s] or self.hint[s]
             room = width - len(s) - 4
             if len(text) > room:
                 text = "…" + text[-(room - 1):]
@@ -71,6 +82,12 @@ class Screen:
 
     def update(self, stream, text):
         self.partial[stream] = text
+        self._clear_footer()
+        self._draw_footer()
+
+    def status(self, stream, text):
+        """Footer text that describes state ("speaking…") and is never saved."""
+        self.hint[stream] = text
         self._clear_footer()
         self._draw_footer()
 
@@ -139,8 +156,113 @@ async def run_stream(name, source, ws_url, screen, gain, turn_detection):
             proc.terminate()
 
 
+def find_khmer_server():
+    for p in (Path(__file__).resolve().with_name("khmer_server.py"),
+              Path.home() / ".local/share/whispering/khmer_server.py"):
+        if p.exists():
+            return p
+    sys.exit("khmer_server.py not found next to whispering or in ~/.local/share/whispering/")
+
+
+def start_khmer_server(model):
+    """Reuse a running Khmer server, or start one and return its process."""
+    url = f"http://127.0.0.1:{KM_PORT}"
+    try:
+        http_json(url, timeout=2)
+        return url, None
+    except Exception:
+        pass
+    logpath = Path.home() / ".cache/whispering/khmer_server.log"
+    logpath.parent.mkdir(parents=True, exist_ok=True)
+    print("# starting the Khmer model (the first run downloads about 2 GB)…", flush=True)
+    proc = subprocess.Popen([str(find_khmer_server()), "--model", model, "--port", str(KM_PORT)],
+                            stdout=open(logpath, "w"), stderr=subprocess.STDOUT,
+                            start_new_session=True)  # so Ctrl+C doesn't kill it mid-request
+    for _ in range(1800):
+        try:
+            http_json(url, timeout=2)
+            return url, proc
+        except Exception:
+            if proc.poll() is not None:
+                sys.exit(f"the Khmer server stopped; see {logpath}")
+            time.sleep(1)
+    proc.terminate()
+    sys.exit(f"the Khmer server did not start in 30 minutes; see {logpath}")
+
+
+def post_pcm(url, pcm):
+    req = urllib.request.Request(f"{url}/transcribe", data=pcm,
+                                 headers={"Content-Type": "application/octet-stream"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read().decode()).get("text", "")
+
+
+def rms(chunk):
+    a = array.array("h", chunk)
+    return math.sqrt(sum(v * v for v in a) / max(len(a), 1)) / 32768
+
+
+async def run_stream_km(name, source, km_url, screen, gain, pause, threshold):
+    """Khmer mode: cut the audio at pauses ourselves and send each piece to khmer_server."""
+    proc = await asyncio.create_subprocess_exec(
+        "parec", "-d", source, "--format=s16le", f"--rate={RATE}", "--channels=1",
+        "--latency-msec=50", "--raw",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    queue = asyncio.Queue()
+
+    async def worker():
+        while True:
+            pcm = await queue.get()
+            screen.status(name, "(transcribing…)")
+            try:
+                text = await asyncio.to_thread(post_pcm, km_url, pcm)
+            except asyncio.CancelledError:
+                KM_PENDING.append((name, pcm, False))
+                raise
+            except Exception as e:
+                screen.info(f"{name}: Khmer server error: {e}")
+                continue
+            screen.status(name, "")
+            if text:
+                screen.final(name, text)
+
+    task = asyncio.create_task(worker())
+    preroll = collections.deque(maxlen=3)  # 300 ms kept from before speech starts
+    buf, in_speech, speech_ms, silence_ms = bytearray(), False, 0, 0
+    try:
+        while chunk := await proc.stdout.readexactly(CHUNK_BYTES):
+            if gain != 1.0:
+                chunk = apply_gain(chunk, gain)
+            if rms(chunk) > threshold:
+                if not in_speech:
+                    in_speech, buf, speech_ms = True, bytearray(b"".join(preroll)), 0
+                    screen.status(name, "(speaking…)")
+                speech_ms += 100
+                silence_ms = 0
+            elif in_speech:
+                silence_ms += 100
+            if not in_speech:
+                preroll.append(chunk)
+                continue
+            buf += chunk
+            if silence_ms >= pause * 1000 or len(buf) >= KM_MAX_SECONDS * RATE * 2:
+                if speech_ms >= 300:
+                    queue.put_nowait(bytes(buf))
+                else:
+                    screen.status(name, "")
+                in_speech, buf, silence_ms = False, bytearray(), 0
+    finally:
+        if proc.returncode is None:
+            proc.terminate()
+        task.cancel()
+        while not queue.empty():
+            KM_PENDING.append((name, queue.get_nowait(), False))
+        if in_speech and speech_ms >= 300:
+            KM_PENDING.append((name, bytes(buf), True))
+
+
 def apply_gain(chunk, gain):
-    import array
     a = array.array("h", chunk)
     for i, v in enumerate(a):
         a[i] = max(-32768, min(32767, int(v * gain)))
@@ -164,6 +286,10 @@ def main():
                    help="silence that ends a line (Lemonade default 0.8)")
     p.add_argument("--threshold", type=float,
                    help="loudness that counts as speech (Lemonade default 0.01); raise if silence produces text")
+    p.add_argument("--language", choices=["auto", "km"], default="auto",
+                   help="km: transcribe Khmer with a local Khmer model instead of Lemonade's Whisper")
+    p.add_argument("--km-model", default=os.environ.get("WHISPERING_KM_MODEL", KM_MODEL),
+                   help="Khmer model id or local path (env WHISPERING_KM_MODEL)")
     p.add_argument("--list", action="store_true", help="list available sources and exit")
     a = p.parse_args()
 
@@ -178,6 +304,9 @@ def main():
         streams["spk"] = a.spk
     if not streams:
         sys.exit("nothing to transcribe")
+
+    if a.language == "km":
+        return main_km(a, streams)
 
     try:
         health = http_json(f"{a.server}/health", timeout=5)
@@ -225,6 +354,54 @@ def main():
         screen.flush_partials()
         if log:
             log.close()
+        print()
+
+
+def open_log(a):
+    if a.no_save:
+        return None
+    path = os.path.expanduser(a.log or f"~/transcripts/{dt.datetime.now():%Y-%m-%d_%H%M}.txt")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    return open(path, "a")
+
+
+def main_km(a, streams):
+    km_url, server = start_khmer_server(a.km_model)
+    log = open_log(a)
+    screen = Screen(list(streams), log)
+    if log:
+        screen.info(f"saving to {log.name}")
+    for name, src in streams.items():
+        screen.info(f"{name}: {src}")
+    pause = a.pause if a.pause is not None else 0.8
+    threshold = a.threshold if a.threshold is not None else 0.01
+    screen.info(f"Khmer model {a.km_model} (local, CPU), pause {pause}s, Ctrl+C to stop")
+
+    async def go():
+        await asyncio.gather(*(
+            run_stream_km(n, s, km_url, screen, a.mic_gain if n == "mic" else 1.0, pause, threshold)
+            for n, s in streams.items()
+        ))
+
+    try:
+        asyncio.run(go())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for name, pcm, cut in KM_PENDING:
+            screen.status(name, "(finishing…)")
+            try:
+                text = post_pcm(km_url, pcm)
+            except Exception as e:
+                screen.info(f"{name}: Khmer server error: {e}")
+                continue
+            screen.status(name, "")
+            if text:
+                screen.final(name, text + (" [cut]" if cut else ""))
+        if log:
+            log.close()
+        if server:
+            server.terminate()
         print()
 
 
