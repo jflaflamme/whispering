@@ -98,6 +98,7 @@ class Screen:
         self.streams = streams
         self.partial = {s: "" for s in streams}
         self.hint = {s: "" for s in streams}
+        self.live_who = {s: "" for s in streams}  # live guess of who is speaking (footer only)
         self.log = log
         self.drawn = 0
 
@@ -110,10 +111,11 @@ class Screen:
         width = shutil.get_terminal_size().columns
         for s in self.streams:
             text = self.partial[s] or self.hint[s]
-            room = width - len(s) - 4
+            tag = f"{s} {self.live_who[s]}…" if self.live_who[s] else s
+            room = width - len(tag) - 4
             if len(text) > room:
                 text = "…" + text[-(room - 1):]
-            sys.stdout.write(f"{DIM}{s}> {text}{RESET}\n")
+            sys.stdout.write(f"{DIM}{tag}> {text}{RESET}\n")
         self.drawn = len(self.streams)
         sys.stdout.flush()
 
@@ -122,20 +124,29 @@ class Screen:
         self._clear_footer()
         self._draw_footer()
 
+    def who(self, stream, label):
+        if self.live_who.get(stream) != label:
+            self.live_who[stream] = label
+            self._clear_footer()
+            self._draw_footer()
+
     def status(self, stream, text):
         """Footer text that describes state ("speaking…") and is never saved."""
         self.hint[stream] = text
         self._clear_footer()
         self._draw_footer()
 
-    def final(self, stream, text):
+    def final(self, stream, text, who=None):
+        """who: speaker label for the other side ("A", "B", "?"), shown and saved as "spk A"."""
         self.partial[stream] = ""
+        self.live_who[stream] = ""
         self._clear_footer()
         ts = dt.datetime.now().strftime("%H:%M:%S")
         color = COLORS.get(stream, "\033[1m")
-        sys.stdout.write(f"{DIM}{ts}{RESET} {color}{stream:>3}{RESET}  {text}\n")
+        tag = f"{stream} {who}" if who else stream
+        sys.stdout.write(f"{DIM}{ts}{RESET} {color}{tag:>5}{RESET}  {text}\n")
         if self.log:
-            self.log.write(f"{ts} [{stream}] {text}\n")
+            self.log.write(f"{ts} [{tag}] {text}\n")
             self.log.flush()
         self._draw_footer()
 
@@ -151,7 +162,7 @@ class Screen:
         self._draw_footer()
 
 
-async def run_stream(name, source, ws_url, screen, gain, turn_detection):
+async def run_stream(name, source, ws_url, screen, gain, turn_detection, speakers=None):
     proc = await asyncio.create_subprocess_exec(
         "parec", "-d", source, "--format=s16le", f"--rate={RATE}", "--channels=1",
         "--latency-msec=50", "--raw",
@@ -164,10 +175,42 @@ async def run_stream(name, source, ws_url, screen, gain, turn_detection):
                 await ws.send(json.dumps({"type": "session.update",
                                           "session": {"turn_detection": turn_detection}}))
 
+            # Speaker labels. Lemonade's speech events arrive too late to cut the audio, so
+            # split the other side's audio at short pauses here, label each piece when it
+            # ends, and give a finished line the voice that spoke most since the last line.
+            seg = Segmenter(SPEAKER_PAUSE_MS) if speakers else None
+            pieces = []  # [stream position at piece end, speech ms, label task]
+            pos, line_mark = [0], [0]
+
+            async def peek(pcm):
+                screen.who(name, await speakers.label(pcm, peek=True))
+
+            async def line_speaker():
+                since, line_mark[0] = line_mark[0], pos[0]
+                votes = {}
+                for end, ms, task in pieces:
+                    if end > since:
+                        label = await task
+                        if label != "?":
+                            votes[label] = votes.get(label, 0) + ms
+                if not votes:
+                    return "?"
+                total = sum(votes.values())  # a line Lemonade merged from several voices shows all of them
+                return "+".join(sorted(v for v, ms in votes.items() if ms >= 0.3 * total))
+
             async def send():
                 while chunk := await proc.stdout.readexactly(CHUNK_BYTES):
                     if gain != 1.0:
                         chunk = apply_gain(chunk, gain)
+                    pos[0] += len(chunk)
+                    if seg:
+                        done, live = seg.feed(chunk)
+                        if live:
+                            asyncio.create_task(peek(live))
+                        if done:
+                            pcm, ms = done
+                            pieces.append([pos[0], ms, asyncio.create_task(speakers.label(pcm))])
+                            del pieces[:-50]
                     await ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": base64.b64encode(chunk).decode(),
@@ -182,7 +225,7 @@ async def run_stream(name, source, ws_url, screen, gain, turn_detection):
                     elif t == "conversation.item.input_audio_transcription.completed":
                         text = " ".join(ev.get("transcript", "").split())
                         if text:
-                            screen.final(name, text)
+                            screen.final(name, text, await line_speaker() if speakers else None)
                         else:
                             screen.update(name, "")
                     elif t == "error":
@@ -200,6 +243,87 @@ async def stop_parec(proc):
         await asyncio.wait_for(asyncio.shield(proc.wait()), 2)
     except (asyncio.TimeoutError, asyncio.CancelledError):
         pass
+
+
+SPEAKER_RMS = 0.01      # loudness that counts as speech when splitting the other side
+SPEAKER_PAUSE_MS = 500  # a pause this long ends a piece (shorter than Lemonade's 0.8 s line end)
+
+
+class Segmenter:
+    """Splits audio at pauses. feed() returns (finished piece or None, live window or None)."""
+
+    def __init__(self, pause_ms):
+        self.pause_ms = pause_ms
+        self.buf, self.pre = bytearray(), collections.deque(maxlen=3)
+        self.on, self.ms, self.quiet, self.peeked = False, 0, 0, 0
+
+    def feed(self, chunk):
+        loud = rms(chunk) > SPEAKER_RMS
+        if loud and not self.on:
+            self.on, self.buf, self.ms, self.peeked = True, bytearray(b"".join(self.pre)), 0, 0
+        if not self.on:
+            self.pre.append(chunk)
+            return None, None
+        self.buf += chunk
+        if loud:
+            self.ms += 100
+            self.quiet = 0
+        else:
+            self.quiet += 100
+        live = None
+        if loud and self.ms >= 1500 and self.ms - self.peeked >= 1500:
+            self.peeked = self.ms
+            live = bytes(self.buf[-4 * RATE * 2:])
+        if self.quiet >= self.pause_ms or len(self.buf) >= 20 * RATE * 2:
+            self.on = False
+            return (bytes(self.buf), self.ms), live
+        return None, live
+
+
+def config_value(key):
+    if CONFIG.exists():
+        for line in CONFIG.read_text().splitlines():
+            k, _, v = line.partition("=")
+            if k.strip() == key and v.strip():
+                return v.strip()
+    return None
+
+
+def find_helper(name):
+    for p in (Path(__file__).resolve().with_name(name), Path.home() / ".local/share/whispering" / name):
+        if p.exists():
+            return p
+    sys.exit(f"{name} not found next to whispering or in ~/.local/share/whispering/")
+
+
+class Speakers:
+    """Talks to speakers.py, which labels pieces of the other side's audio A, B, C."""
+
+    async def start(self, model_dir):
+        self.proc = await asyncio.create_subprocess_exec(
+            str(find_helper("speakers.py")), "--model-dir", model_dir,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+        self.lock, self.n = asyncio.Lock(), 0
+        line = await asyncio.wait_for(self.proc.stdout.readline(), 900)  # first run downloads
+        if b"ready" not in line:
+            raise RuntimeError("speakers.py did not start")
+        return self
+
+    async def label(self, pcm, peek=False):
+        async with self.lock:
+            self.n += 1
+            try:
+                req = {"id": self.n, "pcm": base64.b64encode(pcm).decode(), "peek": peek}
+                self.proc.stdin.write((json.dumps(req) + "\n").encode())
+                await self.proc.stdin.drain()
+                return json.loads(await asyncio.wait_for(self.proc.stdout.readline(), 30))["label"]
+            except Exception:
+                return "?"
+
+    def stop(self):
+        if self.proc.returncode is None:
+            self.proc.terminate()
 
 
 def find_khmer_server():
@@ -248,7 +372,7 @@ def rms(chunk):
     return math.sqrt(sum(v * v for v in a) / max(len(a), 1)) / 32768
 
 
-async def run_stream_km(name, source, km_url, screen, gain, pause, threshold):
+async def run_stream_km(name, source, km_url, screen, gain, pause, threshold, speakers=None):
     """Khmer mode: cut the audio at pauses ourselves and send each piece to khmer_server."""
     proc = await asyncio.create_subprocess_exec(
         "parec", "-d", source, "--format=s16le", f"--rate={RATE}", "--channels=1",
@@ -272,7 +396,7 @@ async def run_stream_km(name, source, km_url, screen, gain, pause, threshold):
                 continue
             screen.status(name, "")
             if text:
-                screen.final(name, text)
+                screen.final(name, text, await speakers.label(pcm) if speakers else None)
 
     task = asyncio.create_task(worker())
     preroll = collections.deque(maxlen=3)  # 300 ms kept from before speech starts
@@ -340,6 +464,8 @@ def main():
                    help="language for the other side only (default: --language)")
     p.add_argument("--km-model", default=os.environ.get("WHISPERING_KM_MODEL", KM_MODEL),
                    help="Khmer model id or local path (env WHISPERING_KM_MODEL)")
+    p.add_argument("--speakers", action="store_true",
+                   help="label the voices on the other side spk A, B, C (local, CPU); or speakers = on in the config")
     p.add_argument("--summary", action="store_true",
                    help="at the end, summarise without asking (local model, see SUMMARY below)")
     p.add_argument("--summary-model", metavar="NAME",
@@ -410,14 +536,29 @@ def main():
         screen.info(f"turn detection: {turn_detection}")
     screen.info("Ctrl+C to stop")
 
+    use_speakers = "spk" in streams and (
+        a.speakers or (config_value("speakers") or "").lower() in ("on", "yes", "true", "1"))
+    model_dir = os.environ.get("WHISPERING_MODEL_DIR") or config_value("model_dir") \
+        or str(Path.home() / ".local/share/whispering/models")
+    helpers = []
+
     async def go():
+        speakers = None
+        if use_speakers:
+            screen.info(f"speaker labels on (model in {model_dir}; the first run downloads 25 MB)")
+            try:
+                speakers = await Speakers().start(model_dir)
+                helpers.append(speakers)
+            except Exception as e:
+                screen.info(f"speaker labels off: {e}")
         tasks = []
         for n, (src, lang) in streams.items():
             gain = a.mic_gain if n == "mic" else 1.0
+            sp = speakers if n == "spk" else None
             if lang == "km":
-                tasks.append(run_stream_km(n, src, km_url, screen, gain, pause, threshold))
+                tasks.append(run_stream_km(n, src, km_url, screen, gain, pause, threshold, sp))
             else:
-                tasks.append(run_stream(n, src, ws_url, screen, gain, turn_detection))
+                tasks.append(run_stream(n, src, ws_url, screen, gain, turn_detection, sp))
         await asyncio.gather(*tasks)
 
     try:
@@ -440,6 +581,8 @@ def main():
             log.close()
         if server:
             server.terminate()
+        for h in helpers:
+            h.stop()
         print()
     if log and os.path.getsize(log.name):
         offer_summary(Path(log.name), a.summary)
@@ -457,7 +600,7 @@ SAME_CALL_GAP_MIN = 20  # an earlier file ending this close is part of the same 
 NAME = __import__("re").compile(r"^(\d{4}-\d\d-\d\d)_(\d{4})(?:_[a-z0-9-]+)?\.txt$")
 
 SUMMARY_PROMPT = """You summarise a call transcript recorded by a live transcriber.
-Each line is "HH:MM:SS [mic|spk] text". [mic] is the user. [spk] is everyone on the other side of the call, sharing one label.
+Each line is "HH:MM:SS [mic|spk] text". [mic] is the user. [spk] is everyone on the other side of the call. When speaker labels are on, [spk A], [spk B] … tell apart voices on the other side ("?" = unknown, "B+C" = several voices in one line); letters are not names, and a name in the text (someone addressed by name) is the only way to know who a letter is.
 
 Write the summary in English Markdown with exactly these sections:
 

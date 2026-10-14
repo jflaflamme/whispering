@@ -48,6 +48,7 @@ whispering --mic-gain 2      # boost a quiet mic
 whispering --pause 1.5       # longer pause before a line ends (default 0.8 s)
 whispering --threshold 0.03  # louder sound needed to count as speech (default 0.01)
 whispering --language km     # Khmer, with a local Khmer model (see below)
+whispering --speakers        # tell the voices on the other side apart: spk A, B, C
 whispering --summary         # summarise at the end without asking
 whispering --summarize FILE  # summarise an existing transcript
 whispering --spk-language km # you in English, the other side in Khmer
@@ -57,6 +58,23 @@ whispering --spk-language km # you in English, the other side in Khmer
 - Every finished line is saved as it happens to `~/transcripts/YYYY-MM-DD_HHMM.txt` (format `HH:MM:SS [mic|spk] text`). The path is printed at startup.
 - Press Ctrl+C to stop. An unfinished sentence is saved with `[cut]` on the end.
 - The mic and speaker side are the ones your call app is using (for example the headset your browser call records from), found at startup. With no call app recording, the system defaults are used. Restart after switching headset or output.
+
+## Speaker labels
+
+With `--speakers` (or `speakers = on` in `~/.config/whispering/config`), lines from the other side are labelled by voice instead of one shared `spk`:
+
+```
+15:02:31   spk A  We still have no answer from the supplier.
+15:02:40   spk B  I can help with that.
+15:02:44   spk ?  Yeah.
+```
+
+While someone is talking, the grey line at the bottom already shows a live guess (`spk B…`), checked every 1.5 seconds.
+
+- A small helper, `speakers.py`, computes a voiceprint for each stretch of speech with the 3D-Speaker ERes2Net model through [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx), on the CPU. Voices are grouped as they come: no names and nothing leaves the laptop. The model (25 MB) downloads on first use to `~/.local/share/whispering/models`, or to `model_dir` from the config (or `WHISPERING_MODEL_DIR`).
+- Letters are per run: `spk A` today is not `spk A` tomorrow. Names are not detected (yet); the summary can sometimes tell who is who from how people address each other.
+- `?` means a stretch too short to recognise (under about 2.5 s for a new voice). `B+C` means Lemonade merged two voices into one line, which happens when people answer each other without a pause.
+- Tested on real voices (a three-person LibriSpeech conversation) and on a real call recording; best with two to four clearly different voices. Similar voices, people talking over each other and very short replies remain hard.
 
 ## Summary at the end of a call
 

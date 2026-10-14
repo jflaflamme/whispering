@@ -21,6 +21,8 @@ chmod +x "$BIN_DIR/whispering"
 mkdir -p "$SHARE_DIR"
 curl -fsSL "$REPO_RAW/khmer_server.py" -o "$SHARE_DIR/khmer_server.py"
 chmod +x "$SHARE_DIR/khmer_server.py"
+curl -fsSL "$REPO_RAW/speakers.py" -o "$SHARE_DIR/speakers.py"
+chmod +x "$SHARE_DIR/speakers.py"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
