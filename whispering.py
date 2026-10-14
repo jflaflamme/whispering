@@ -40,11 +40,48 @@ KM_MAX_SECONDS = 25  # cut long unbroken speech so the model stays under its 30 
 KM_PENDING = []  # (stream, pcm, cut) left over at Ctrl+C, transcribed before exit
 
 
+OUR_APPS = {"pacat", "parec", "ffmpeg", "python3", "python"}  # our own recorders, not the call
+
+
+def pactl_json(*args):
+    try:
+        out = subprocess.run(["pactl", "-f", "json", *args], capture_output=True, text=True).stdout
+        return json.loads(out or "[]")
+    except (OSError, ValueError):
+        return []
+
+
 def default_sources():
+    """Pick the mic and speaker the call is using: the newest recording stream from
+    another app (the call app), and the output that same app plays to. Falls back to
+    the system defaults. Returns (mic, spk, why)."""
     def get(cmd):
         return subprocess.run(["pactl", cmd], capture_output=True, text=True).stdout.strip()
 
-    return get("get-default-source"), get("get-default-sink") + ".monitor"
+    mic, spk, why = get("get-default-source"), get("get-default-sink") + ".monitor", "system default"
+    sources = {s["index"]: s["name"] for s in pactl_json("list", "sources")}
+    monitors = {s["index"]: s.get("monitor_source") for s in pactl_json("list", "sinks")}
+
+    def streams(kind, key):
+        found = []
+        for o in sorted(pactl_json("list", kind), key=lambda o: o["index"]):
+            props = o.get("properties", {})
+            binary = props.get("application.process.binary", "")
+            if binary in OUR_APPS or o.get("corked"):
+                continue
+            found.append((binary, props.get("application.name", binary), o[key]))
+        return found
+
+    recorders = [(b, n, sources.get(i, "")) for b, n, i in streams("source-outputs", "source")]
+    recorders = [r for r in recorders if r[2] and not r[2].endswith(".monitor")]
+    if recorders:
+        binary, app, mic = recorders[-1]
+        why = f"used by {app}"
+        players = [(b, monitors.get(i)) for b, _, i in streams("sink-inputs", "sink") if monitors.get(i)]
+        same_app = [m for b, m in players if b == binary]
+        if same_app:
+            spk = same_app[-1]
+    return mic, spk, why
 
 
 def http_json(url, payload=None, timeout=180):
@@ -119,6 +156,7 @@ async def run_stream(name, source, ws_url, screen, gain, turn_detection):
         "parec", "-d", source, "--format=s16le", f"--rate={RATE}", "--channels=1",
         "--latency-msec=50", "--raw",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True,  # Ctrl+C reaches us, and we stop parec ourselves
     )
     try:
         async with websockets.connect(ws_url, max_size=None) as ws:
@@ -152,8 +190,16 @@ async def run_stream(name, source, ws_url, screen, gain, turn_detection):
 
             await asyncio.gather(send(), recv())
     finally:
-        if proc.returncode is None:
-            proc.terminate()
+        await stop_parec(proc)
+
+
+async def stop_parec(proc):
+    if proc.returncode is None:
+        proc.terminate()
+    try:
+        await asyncio.wait_for(asyncio.shield(proc.wait()), 2)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
 
 
 def find_khmer_server():
@@ -208,6 +254,7 @@ async def run_stream_km(name, source, km_url, screen, gain, pause, threshold):
         "parec", "-d", source, "--format=s16le", f"--rate={RATE}", "--channels=1",
         "--latency-msec=50", "--raw",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True,  # Ctrl+C reaches us, and we stop parec ourselves
     )
     queue = asyncio.Queue()
 
@@ -253,8 +300,7 @@ async def run_stream_km(name, source, km_url, screen, gain, pause, threshold):
                     screen.status(name, "")
                 in_speech, buf, silence_ms = False, bytearray(), 0
     finally:
-        if proc.returncode is None:
-            proc.terminate()
+        await stop_parec(proc)
         task.cancel()
         while not queue.empty():
             KM_PENDING.append((name, queue.get_nowait(), False))
@@ -270,7 +316,7 @@ def apply_gain(chunk, gain):
 
 
 def main():
-    mic_default, spk_default = default_sources()
+    mic_default, spk_default, why = default_sources()
     p = argparse.ArgumentParser(description="Live transcription of mic and speaker monitor via Lemonade.")
     p.add_argument("--mic", default=mic_default, help=f"mic source (default: {mic_default})")
     p.add_argument("--spk", default=spk_default, help=f"speaker monitor source (default: {spk_default})")
@@ -294,11 +340,23 @@ def main():
                    help="language for the other side only (default: --language)")
     p.add_argument("--km-model", default=os.environ.get("WHISPERING_KM_MODEL", KM_MODEL),
                    help="Khmer model id or local path (env WHISPERING_KM_MODEL)")
+    p.add_argument("--summary", action="store_true",
+                   help="at the end, summarise without asking (local model, see SUMMARY below)")
+    p.add_argument("--summary-model", metavar="NAME",
+                   help=f"Lemonade chat model for summaries (default: summary_model in {CONFIG})")
+    p.add_argument("--summarize", metavar="TRANSCRIPT", nargs="+",
+                   help="summarise existing transcript file(s) and exit")
     p.add_argument("--list", action="store_true", help="list available sources and exit")
     a = p.parse_args()
 
     if a.list:
         subprocess.run(["pactl", "list", "short", "sources"])
+        return
+    global SUMMARY_MODEL
+    SUMMARY_MODEL = a.summary_model
+    if a.summarize:
+        paths = [Path(f).expanduser() for f in a.summarize]
+        summarize(call_files(paths[0]) if len(paths) == 1 else paths)
         return
 
     streams = {}  # name -> (source, language)
@@ -346,7 +404,8 @@ def main():
         screen.info(f"saving to {log.name}")
     for name, (src, lang) in streams.items():
         engine = f"Khmer model {a.km_model} (local, CPU)" if lang == "km" else f"Lemonade {a.model}"
-        screen.info(f"{name}: {src} -> {engine}")
+        auto = f" ({why})" if src == {"mic": mic_default, "spk": spk_default}[name] else ""
+        screen.info(f"{name}: {src}{auto} -> {engine}")
     if turn_detection:
         screen.info(f"turn detection: {turn_detection}")
     screen.info("Ctrl+C to stop")
@@ -382,6 +441,202 @@ def main():
         if server:
             server.terminate()
         print()
+    if log and os.path.getsize(log.name):
+        offer_summary(Path(log.name), a.summary)
+
+
+# ---------------------------------------------------------------- SUMMARY
+# At the end of a run: s = summarise with a Lemonade chat model, q or Ctrl+C = quit.
+# The model is a per-person setting (--summary-model, WHISPERING_SUMMARY_MODEL,
+# or "summary_model = <name>" in ~/.config/whispering/config). whispering never
+# unloads anything; it refuses to load a model that doesn't fit in free memory.
+
+LEMONADE_API = "http://localhost:13305/api/v1"
+CONFIG = Path.home() / ".config/whispering/config"
+SAME_CALL_GAP_MIN = 20  # an earlier file ending this close is part of the same call
+NAME = __import__("re").compile(r"^(\d{4}-\d\d-\d\d)_(\d{4})(?:_[a-z0-9-]+)?\.txt$")
+
+SUMMARY_PROMPT = """You summarise a call transcript recorded by a live transcriber.
+Each line is "HH:MM:SS [mic|spk] text". [mic] is the user. [spk] is everyone on the other side of the call, sharing one label.
+
+Write the summary in English Markdown with exactly these sections:
+
+# <Topic>, <date>
+## Overview (first sentence: what the call was about and its main outcome; then who was on it)
+## Topics discussed (one ### per topic, a short paragraph then bullets)
+## Decisions (bullets)
+## Action items (one flat checklist, each item as "- [ ] ..."; no owners, no names, no grouping)
+## Open questions
+
+Rules, more important than style:
+- Use only what the transcript says. Never invent names, dates, numbers, owners or decisions.
+- Spell names as they appear. If a name is uncertain, say so.
+- Do not say who will do an action item. Write each one as the task itself ("Reply to the supplier's last email introducing the new supply chain manager"), without a person's name or "Jeff will". Who does what is checked by a person afterwards.
+- [spk] is several people: don't attribute a [spk] statement to one person unless a name in the text makes it clear.
+- Ignore transcription noise: repeated "Thank you.", ".", "...", sound tags like *Loud noise*, stray words in another language, a phrase looping.
+- Leave out private side conversations that are not part of the call.
+- Never use the em-dash character. Use commas, colons or full stops.
+
+After the summary, on the very last line, write a topic slug for file names: "SLUG: " followed by 2 to 4 lowercase words joined by hyphens.
+"""
+
+
+def offer_summary(path, auto):
+    if not auto:
+        if not sys.stdin.isatty():
+            return
+        print(f"{DIM}# s = summarise this call, q or Ctrl+C = quit{RESET}", flush=True)
+        if read_key() != "s":
+            return
+    summarize(call_files(path))
+
+
+def read_key():
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)  # keeps Ctrl+C working
+        return sys.stdin.read(1).lower()
+    except KeyboardInterrupt:
+        return "q"
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def span(path):
+    """First and last HH:MM:SS of a transcript."""
+    times = [line[:8] for line in path.read_text(errors="replace").splitlines()
+             if len(line) > 10 and line[2] == ":" and line[8] == " "]
+    return (times[0], times[-1]) if times else (None, None)
+
+
+def call_files(path):
+    """This transcript plus the earlier ones of the same call (a restart mid-call)."""
+    m = NAME.match(path.name)
+    if not m:
+        return [path]
+    day = m.group(1)
+    earlier = sorted(f for f in path.parent.glob(f"{day}_*.txt") if NAME.match(f.name) and f.name < path.name)
+    files = [path]
+    for f in reversed(earlier):
+        start = span(files[0])[0]
+        end = span(f)[1]
+        if not start or not end:
+            break
+        gap = (dt.datetime.strptime(start, "%H:%M:%S") - dt.datetime.strptime(end, "%H:%M:%S")).total_seconds()
+        if 0 <= gap <= SAME_CALL_GAP_MIN * 60:
+            files.insert(0, f)
+        else:
+            break
+    return files
+
+
+SUMMARY_MODEL = None  # set from --summary-model in main()
+
+
+def summary_model():
+    if SUMMARY_MODEL:
+        return SUMMARY_MODEL
+    if os.environ.get("WHISPERING_SUMMARY_MODEL"):
+        return os.environ["WHISPERING_SUMMARY_MODEL"]
+    if CONFIG.exists():
+        for line in CONFIG.read_text().splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "summary_model" and value.strip():
+                return value.strip()
+    return None
+
+
+def pick_llm():
+    """The configured Lemonade model, if it is loaded or fits in free memory."""
+    model = summary_model()
+    if not model:
+        print("# no summary model set. Pick a Lemonade chat model (`lemonade list`) and add\n"
+              f"#   summary_model = <model name>\n# to {CONFIG}, or use --summary-model <name>")
+        return None
+    try:
+        health = http_json(f"{LEMONADE_API}/health", timeout=3)
+        if model not in [m.get("model_name") for m in health.get("all_models_loaded", [])]:
+            info = next((m for m in http_json(f"{LEMONADE_API}/models", timeout=5)["data"] if m["id"] == model), None)
+            if not info or not info.get("downloaded"):
+                print(f"# summary model {model} is not downloaded in Lemonade (`lemonade pull {model}`)")
+                return None
+            need = (info.get("size") or 0) + 8
+            avail = int(next(l.split()[1] for l in open("/proc/meminfo") if l.startswith("MemAvailable"))) / 2**20
+            if avail < need:
+                print(f"# not enough free memory to load {model}: {avail:.0f} GB free, needs about {need:.0f} GB")
+                return None
+        return LEMONADE_API, model, model
+    except Exception as e:
+        print(f"# Lemonade not reachable for the summary: {e}")
+        return None
+
+
+def summarize(files):
+    files = [f for f in files if f.exists()]
+    if not files:
+        sys.exit("no transcript to summarise")
+    llm = pick_llm()
+    if not llm:
+        print(f"# to summarise later: whispering --summarize {' '.join(str(f) for f in files)}")
+        return
+    url, model, label = llm
+    day = NAME.match(files[0].name).group(1) if NAME.match(files[0].name) else dt.date.today().isoformat()
+    text = "\n\n".join(f"### File {f.name}\n{f.read_text(errors='replace')}" for f in files)
+    body = {"model": model, "temperature": 0.2, "max_tokens": 6000,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "messages": [{"role": "system", "content": SUMMARY_PROMPT},
+                         {"role": "user", "content": f"Date: {day}\n\n{text}"}]}
+    print(f"# summarising {len(files)} file(s) with {label}…", flush=True)
+    t = time.time()
+    req = urllib.request.Request(f"{url}/chat/completions", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=1800) as r:
+            out = json.loads(r.read())["choices"][0]["message"].get("content") or ""
+    except Exception as e:
+        print(f"# summary failed: {e}")
+        return
+    import re
+    slug = "call"
+    m = re.search(r"^\s*SLUG:\s*(.+?)\s*$", out, re.M)
+    if m:
+        words = re.sub(r"[^a-z0-9]+", "-", m.group(1).lower()).strip("-").split("-")
+        slug = "-".join(w for w in words if w)[:40].strip("-") or "call"
+        out = out[:m.start()].rstrip() + "\n"
+    out = out.replace(" \u2014 ", ", ").replace("\u2014", ", ")
+
+    renamed = []
+    for f in files:
+        mm = NAME.match(f.name)
+        if mm and f.name == f"{mm.group(1)}_{mm.group(2)}.txt":
+            new = f.with_name(f"{mm.group(1)}_{mm.group(2)}_{slug}.txt")
+            if not new.exists():
+                f.rename(new)
+                f = new
+        renamed.append(f)
+    spans = [f"`{f.name}` ({span(f)[0][:5]} to {span(f)[1][:5]})" for f in renamed if span(f)[0]]
+    source = (f"Source: {' and '.join(spans)}. Whisper transcript; names spelled as heard.\n"
+              f"Draft by a local model ({label}): check names and action items before sending.\n")
+    lines = out.strip().splitlines()
+    if lines and lines[0].startswith("# "):
+        out = lines[0] + "\n\n" + source + "\n" + "\n".join(lines[1:]).strip() + "\n"
+    else:
+        out = source + "\n" + out
+    target = files[0].parent / f"{day}_{slug}_summary.md"
+    if target.exists():
+        target = files[0].parent / f"{day}_{NAME.match(renamed[0].name).group(2) if NAME.match(renamed[0].name) else 'x'}_{slug}_summary.md"
+    n = 2
+    while target.exists():
+        target = target.with_name(f"{day}_{slug}_summary-{n}.md")
+        n += 1
+    target.write_text(out)
+    print(f"# summary ({time.time() - t:.0f}s): {target}")
+    for old, new in zip(files, renamed):
+        if old != new:
+            print(f"# renamed {old.name} -> {new.name}")
 
 
 if __name__ == "__main__":

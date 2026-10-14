@@ -48,13 +48,36 @@ whispering --mic-gain 2      # boost a quiet mic
 whispering --pause 1.5       # longer pause before a line ends (default 0.8 s)
 whispering --threshold 0.03  # louder sound needed to count as speech (default 0.01)
 whispering --language km     # Khmer, with a local Khmer model (see below)
+whispering --summary         # summarise at the end without asking
+whispering --summarize FILE  # summarise an existing transcript
 whispering --spk-language km # you in English, the other side in Khmer
 ```
 
 - Finished lines scroll with a timestamp, `mic` in cyan and `spk` in yellow. The grey lines at the bottom show text still being recognised. A line is finalised when the speaker pauses for 0.8 s (change with `--pause`).
 - Every finished line is saved as it happens to `~/transcripts/YYYY-MM-DD_HHMM.txt` (format `HH:MM:SS [mic|spk] text`). The path is printed at startup.
 - Press Ctrl+C to stop. An unfinished sentence is saved with `[cut]` on the end.
-- Default devices are read at startup: restart after switching headset or output.
+- The mic and speaker side are the ones your call app is using (for example the headset your browser call records from), found at startup. With no call app recording, the system defaults are used. Restart after switching headset or output.
+
+## Summary at the end of a call
+
+After Ctrl+C, whispering offers `s = summarise this call, q or Ctrl+C = quit`. With `s`, a local chat model in Lemonade writes a Markdown summary (overview, topics, decisions, action items, open questions), and the transcript and summary are renamed by topic:
+
+```
+2026-10-07_1539_stove-pilot.txt
+2026-10-07_stove-pilot_summary.md
+```
+
+If whispering was restarted during the call, the earlier file (ending less than 20 minutes before) is included. `whispering --summarize <file>` does the same for an existing transcript.
+
+Pick the model once, in `~/.config/whispering/config`:
+
+```
+summary_model = <Lemonade model name>
+```
+
+or per run with `--summary-model <name>`. Use a model that fits your memory: whispering checks free memory before loading it and refuses if it doesn't fit, and never unloads anything. In our tests on a 22-minute call, large models (Qwen3.6-35B-A3B, about 30 s; Qwen3.8-27B, about 90 s) gave usable drafts, and small ones (1 to 8B) invented facts and people. A GGUF you already have outside Lemonade can be used without downloading it again: `lemonade config set extra_models_dir=/path/to/folder`, then use the `extra.<name>` it lists.
+
+The summary is a draft by a local model: check it before sending. Action items are listed without owners on purpose, because local models often guess wrong about who will do what.
 
 ## Khmer
 
