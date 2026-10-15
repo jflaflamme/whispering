@@ -40,7 +40,8 @@ KM_MODEL = "1morecupofhottea/whisper-turbo-khmer-v9"
 KM_PORT = 13399
 KM_MAX_SECONDS = 25  # cut long unbroken speech so the model stays under its 30 s window
 KM_PENDING = []  # (stream, pcm, cut) left over at Ctrl+C, transcribed before exit
-AUDIO = {}  # stream -> wave writer (audio kept next to the transcript unless --no-audio)
+AUDIO = {}  # stream -> AudioOut (audio kept next to the transcript unless --no-audio)
+MERGED = {}  # stream -> {"C": "A"}: voice letters merged during the run
 
 
 OUR_APPS = {"pacat", "parec", "ffmpeg", "python3", "python"}  # our own recorders, not the call
@@ -380,6 +381,17 @@ class Speakers:
             except Exception:
                 return "?"
 
+    async def aliases(self):
+        """Letters merged into others during the run, e.g. {"C": "A"}."""
+        async with self.lock:
+            self.n += 1
+            try:
+                self.proc.stdin.write((json.dumps({"id": self.n, "cmd": "aliases"}) + "\n").encode())
+                await self.proc.stdin.drain()
+                return json.loads(await asyncio.wait_for(self.proc.stdout.readline(), 5))["aliases"]
+            except Exception:
+                return {}
+
     async def stop(self):
         if self.proc.returncode is None:
             try:  # the whole group: `uv run` does not always pass the signal on to python
@@ -503,33 +515,72 @@ async def run_stream_km(name, source, km_url, screen, gain, pause, threshold, sp
 AUDIO_EXTS = [f".{side}.{ext}" for side in ("mic", "spk") for ext in ("opus", "wav")]
 
 
-def keep_audio(transcript, sides):
-    """After a run: drop the audio if nothing was said, else compress it to Opus when ffmpeg
-    is there (speech at 24 kbit/s: about 11 MB an hour instead of 115 MB)."""
-    wavs = [transcript.with_suffix(f".{s}.wav") for s in sides]
-    if not transcript.exists() or not transcript.stat().st_size:
-        for w in wavs:
-            w.unlink(missing_ok=True)
+class AudioOut:
+    """One side's audio next to the transcript. With ffmpeg it is compressed to Opus while
+    recording (speech at 24 kbit/s: about 11 MB an hour instead of 115 MB as WAV, for about
+    2% of one core), so stopping is instant; compressing a 49-minute call afterwards took
+    48 s per side. Without ffmpeg it is written as WAV."""
+
+    def __init__(self, transcript, side):
+        self.proc = None
+        if shutil.which("ffmpeg"):
+            self.path = transcript.with_suffix(f".{side}.opus")
+            self.proc = subprocess.Popen(
+                ["ffmpeg", "-loglevel", "error", "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-i", "pipe:0",
+                 "-c:a", "libopus", "-b:a", "24k", "-application", "voip", str(self.path)],
+                stdin=subprocess.PIPE, start_new_session=True)  # Ctrl+C must not cut the file short
+        else:
+            self.path = transcript.with_suffix(f".{side}.wav")
+            self.wav = wave.open(str(self.path), "wb")
+            self.wav.setnchannels(1), self.wav.setsampwidth(2), self.wav.setframerate(RATE)
+
+    def writeframes(self, chunk):
+        if self.proc:
+            try:
+                self.proc.stdin.write(chunk)
+            except (BrokenPipeError, ValueError):
+                pass  # ffmpeg stopped: the transcript goes on without audio
+        else:
+            self.wav.writeframes(chunk)
+
+    def close(self):
+        if self.proc:
+            try:
+                self.proc.stdin.close()
+                self.proc.wait(30)
+            except (BrokenPipeError, subprocess.TimeoutExpired):
+                self.proc.kill()
+        else:
+            self.wav.close()
+
+
+def relabel(transcript, merged):
+    """Rewrite letters that turned out to be the same voice (spk C -> spk A) in the transcript."""
+    if not any(merged.values()) or not transcript.exists():
         return
-    kept = []
-    # A second Ctrl+C often arrives just after the first (uv passes it on), so compressing
-    # (seconds, even for an hour) ignores it, and ffmpeg runs outside the terminal's group.
-    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
-    try:
-        for w in wavs:
-            opus = w.with_suffix(".opus")
-            if shutil.which("ffmpeg") and not opus.exists():
-                if subprocess.run(["ffmpeg", "-loglevel", "error", "-nostdin", "-i", str(w),
-                                   "-c:a", "libopus", "-b:a", "24k", "-application", "voip", str(opus)],
-                                  start_new_session=True).returncode == 0 and opus.stat().st_size:
-                    w.unlink()
-                    w = opus
-                else:
-                    opus.unlink(missing_ok=True)
-            kept.append(f"{w.name} ({w.stat().st_size / 1e6:.1f} MB)")
-    finally:
-        signal.signal(signal.SIGINT, old)
-    print(f"# audio: {', '.join(kept)}")
+    tag = __import__("re").compile(r"^(\S+) \[(mic|spk) ([A-Z?+]+)\]")
+
+    def fix(m):
+        letters = {merged.get(m.group(2), {}).get(x, x) for x in m.group(3).split("+")}
+        letters = sorted(letters - {"?"}) or ["?"]  # "A+?" is just A
+        return f"{m.group(1)} [{m.group(2)} {'+'.join(letters)}]"
+    lines = transcript.read_text().splitlines(keepends=True)
+    transcript.write_text("".join(tag.sub(fix, line) for line in lines))
+    for side, m in merged.items():
+        if m:
+            print(f"# {side}: letters corrected in the transcript: "
+                  + ", ".join(f"{side} {a} is {side} {b}" if b != "?" else f"{side} {a} (heard once) is now {side} ?"
+                              for a, b in sorted(m.items())))
+
+
+def keep_audio(transcript):
+    """After a run: drop the audio if nothing was said, else say where it is."""
+    paths = [a.path for a in AUDIO.values() if a.path.exists()]
+    if not transcript.exists() or not transcript.stat().st_size:
+        for f in paths:
+            f.unlink()
+        return
+    print("# audio: " + ", ".join(f"{f.name} ({f.stat().st_size / 1e6:.1f} MB)" for f in paths))
 
 
 def apply_gain(chunk, gain):
@@ -634,9 +685,7 @@ def main():
         screen.info(f"saving to {log.name}")
         if not a.no_audio and (config_value("keep_audio") or "on").lower() not in ("off", "no", "false", "0"):
             for name in streams:
-                wav = Path(log.name).with_suffix(f".{name}.wav")
-                AUDIO[name] = w = wave.open(str(wav), "wb")
-                w.setnchannels(1), w.setsampwidth(2), w.setframerate(RATE)
+                AUDIO[name] = AudioOut(Path(log.name), name)
             screen.info("keeping the audio next to it (--no-audio to stop)")
     for name, (src, lang) in streams.items():
         engine = f"Khmer model {a.km_model} (local, CPU)" if lang == "km" else f"Lemonade {a.model}"
@@ -679,8 +728,12 @@ def main():
                 tasks.append(run_stream(n, src, ws_url, screen, gain, turn_detection, sp))
         try:
             await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            screen.info("stopping…")  # Ctrl+C: say so at once, closing takes a moment
+            raise
         finally:
-            for sp in speakers.values():
+            for n, sp in speakers.items():
+                MERGED[n] = await sp.aliases()
                 await sp.stop()
 
     try:
@@ -701,13 +754,14 @@ def main():
                 screen.final(name, text + (" [cut]" if cut else ""))
         if log:
             log.close()
-        for w in AUDIO.values():
-            w.close()
+            relabel(Path(log.name), MERGED)
+        for out in AUDIO.values():
+            out.close()
         if server:
             server.terminate()
         print()
         if AUDIO:
-            keep_audio(Path(log.name), list(AUDIO))
+            keep_audio(Path(log.name))
     if log and os.path.getsize(log.name):
         offer_summary(Path(log.name), a.summary)
 
