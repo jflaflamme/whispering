@@ -40,7 +40,7 @@ KM_MODEL = "1morecupofhottea/whisper-turbo-khmer-v9"
 KM_PORT = 13399
 KM_MAX_SECONDS = 25  # cut long unbroken speech so the model stays under its 30 s window
 KM_PENDING = []  # (stream, pcm, cut) left over at Ctrl+C, transcribed before exit
-AUDIO = {}  # stream -> wave writer, with --keep-audio
+AUDIO = {}  # stream -> wave writer (audio kept next to the transcript unless --no-audio)
 
 
 OUR_APPS = {"pacat", "parec", "ffmpeg", "python3", "python"}  # our own recorders, not the call
@@ -272,7 +272,15 @@ async def stop_parec(proc):
     try:
         await asyncio.wait_for(asyncio.shield(proc.wait()), 2)
     except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
+        # Cut short (asyncio cancels again at exit): kill it and close its pipes now, or
+        # asyncio prints "Event loop is closed" when it cleans up after the loop is gone.
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        if getattr(proc, "_transport", None):
+            proc._transport.close()
 
 
 SPEAKER_RMS = 0.01      # loudness that counts as speech when splitting the other side
@@ -492,6 +500,38 @@ async def run_stream_km(name, source, km_url, screen, gain, pause, threshold, sp
             KM_PENDING.append((name, bytes(buf), True))
 
 
+AUDIO_EXTS = [f".{side}.{ext}" for side in ("mic", "spk") for ext in ("opus", "wav")]
+
+
+def keep_audio(transcript, sides):
+    """After a run: drop the audio if nothing was said, else compress it to Opus when ffmpeg
+    is there (speech at 24 kbit/s: about 11 MB an hour instead of 115 MB)."""
+    wavs = [transcript.with_suffix(f".{s}.wav") for s in sides]
+    if not transcript.exists() or not transcript.stat().st_size:
+        for w in wavs:
+            w.unlink(missing_ok=True)
+        return
+    kept = []
+    # A second Ctrl+C often arrives just after the first (uv passes it on), so compressing
+    # (seconds, even for an hour) ignores it, and ffmpeg runs outside the terminal's group.
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        for w in wavs:
+            opus = w.with_suffix(".opus")
+            if shutil.which("ffmpeg") and not opus.exists():
+                if subprocess.run(["ffmpeg", "-loglevel", "error", "-nostdin", "-i", str(w),
+                                   "-c:a", "libopus", "-b:a", "24k", "-application", "voip", str(opus)],
+                                  start_new_session=True).returncode == 0 and opus.stat().st_size:
+                    w.unlink()
+                    w = opus
+                else:
+                    opus.unlink(missing_ok=True)
+            kept.append(f"{w.name} ({w.stat().st_size / 1e6:.1f} MB)")
+    finally:
+        signal.signal(signal.SIGINT, old)
+    print(f"# audio: {', '.join(kept)}")
+
+
 def apply_gain(chunk, gain):
     a = array.array("h", chunk)
     for i, v in enumerate(a):
@@ -511,8 +551,8 @@ def main():
     p.add_argument("-o", "--log", help="append final lines to this file "
                    "(default: ~/transcripts/YYYY-MM-DD_HHMM.txt)")
     p.add_argument("--no-save", action="store_true", help="do not write a transcript file")
-    p.add_argument("--keep-audio", action="store_true",
-                   help="also save each side's audio next to the transcript (<transcript>.mic.wav, .spk.wav)")
+    p.add_argument("--no-audio", action="store_true",
+                   help="do not keep the audio next to the transcript (or keep_audio = off in the config)")
     p.add_argument("--mic-gain", type=float, default=1.0, help="multiply mic samples (e.g. 2.0)")
     p.add_argument("--pause", type=float, metavar="SEC",
                    help="silence that ends a line (Lemonade default 0.8)")
@@ -592,12 +632,12 @@ def main():
     screen = Screen(list(streams), log)
     if log:
         screen.info(f"saving to {log.name}")
-        if a.keep_audio:
+        if not a.no_audio and (config_value("keep_audio") or "on").lower() not in ("off", "no", "false", "0"):
             for name in streams:
                 wav = Path(log.name).with_suffix(f".{name}.wav")
                 AUDIO[name] = w = wave.open(str(wav), "wb")
                 w.setnchannels(1), w.setsampwidth(2), w.setframerate(RATE)
-                screen.info(f"keeping the {name} audio: {wav.name}")
+            screen.info("keeping the audio next to it (--no-audio to stop)")
     for name, (src, lang) in streams.items():
         engine = f"Khmer model {a.km_model} (local, CPU)" if lang == "km" else f"Lemonade {a.model}"
         auto = f" ({why})" if src == {"mic": mic_default, "spk": spk_default}[name] else ""
@@ -666,6 +706,8 @@ def main():
         if server:
             server.terminate()
         print()
+        if AUDIO:
+            keep_audio(Path(log.name), list(AUDIO))
     if log and os.path.getsize(log.name):
         offer_summary(Path(log.name), a.summary)
 
@@ -839,10 +881,9 @@ def summarize(files):
         if mm and f.name == f"{mm.group(1)}_{mm.group(2)}.txt":
             new = f.with_name(f"{mm.group(1)}_{mm.group(2)}_{slug}.txt")
             if not new.exists():
-                for side in ("mic", "spk"):  # audio kept with --keep-audio follows its transcript
-                    wav = f.with_suffix(f".{side}.wav")
-                    if wav.exists() and not new.with_suffix(f".{side}.wav").exists():
-                        wav.rename(new.with_suffix(f".{side}.wav"))
+                for ext in AUDIO_EXTS:  # the audio follows its transcript
+                    if f.with_suffix(ext).exists() and not new.with_suffix(ext).exists():
+                        f.with_suffix(ext).rename(new.with_suffix(ext))
                 f.rename(new)
                 f = new
         renamed.append(f)

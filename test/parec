@@ -10,4 +10,8 @@ while [ $# -gt 0 ]; do
 done
 wav="$WHISPERING_TEST_WAV"
 [ -n "$WHISPERING_TEST_DIR" ] && wav="$WHISPERING_TEST_DIR/$src.wav"
-exec ffmpeg -loglevel error -re -i "$wav" -af apad -ar 16000 -ac 1 -f s16le -
+# Both inputs are read in real time (-re): with "-af apad" the silence after the file
+# came out as fast as possible (25 s of test wrote hours of audio).
+exec ffmpeg -loglevel error -re -i "$wav" -re -f lavfi -i anullsrc=r=16000:cl=mono \
+  -filter_complex "[0]aresample=16000,aformat=sample_fmts=s16:channel_layouts=mono[a];[a][1]concat=n=2:v=0:a=1" \
+  -f s16le -

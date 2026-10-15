@@ -84,7 +84,6 @@ whispering --no-spk --speakers     # lines show mic A, mic B, ...
 - With labels on, the other side's lines end at shorter pauses (0.6 s instead of 0.8 s), so each line holds one voice. Someone talking for a long time without pausing (or over background music) gets a new line every 10 to 20 seconds, cut between words, and earlier when the voice changes, so the screen keeps scrolling.
 - `?` means a stretch too short to recognise (under about 2.5 s for a new voice). `B+C` means two voices ended up in one line, which can still happen when people talk over each other.
 - Tested on real voices (a three-person LibriSpeech conversation) and on a real call recording; best with two to four clearly different voices. Similar voices, people talking over each other and very short replies remain hard.
-- `--keep-audio` also saves each side's audio next to the transcript (`2026-10-15_0906.mic.wav`, `.spk.wav`, about 115 MB per hour per side). Off by default; useful to report a wrong label, since the audio shows what the model heard.
 
 ### Testing the speakers branch
 
@@ -97,6 +96,12 @@ whispering --no-spk --speakers        # a meeting room
 ```
 
 On a checkout: `git fetch && git checkout speakers && ./whispering.py --speakers`. The first run downloads the speaker model (25 MB) and the sherpa-onnx package.
+
+## Audio next to the transcript
+
+whispering keeps each side's audio next to its transcript, so you can listen back to a passage the transcript got wrong: `2026-10-15_0906.mic.opus` and `.spk.opus`. It is written as WAV during the run (nothing is lost if whispering stops) and compressed to Opus at the end when `ffmpeg` is installed: about 11 MB per hour per side, instead of 115 MB as WAV. A run in which nothing was said keeps no audio. The audio is renamed together with the transcript when the summary gives it a topic name.
+
+Turn it off with `--no-audio`, or for good with `keep_audio = off` in `~/.config/whispering/config`. Recordings of other people's voices may need their consent where you are.
 
 ## Summary at the end of a call
 
