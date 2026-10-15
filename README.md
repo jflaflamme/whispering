@@ -73,8 +73,20 @@ While someone is talking, the grey line at the bottom already shows a live guess
 
 - A small helper, `speakers.py`, computes a voiceprint for each stretch of speech with the 3D-Speaker ERes2Net model through [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx), on the CPU. Voices are grouped as they come: no names and nothing leaves the laptop. The model (25 MB) downloads on first use to `~/.local/share/whispering/models`, or to `model_dir` from the config (or `WHISPERING_MODEL_DIR`).
 - Letters are per run: `spk A` today is not `spk A` tomorrow. Names are not detected (yet); the summary can sometimes tell who is who from how people address each other.
-- `?` means a stretch too short to recognise (under about 2.5 s for a new voice). `B+C` means Lemonade merged two voices into one line, which happens when people answer each other without a pause.
+- With labels on, the other side's lines end at shorter pauses (0.6 s instead of 0.8 s), so each line holds one voice. Someone talking for a long time without pausing (or over background music) gets a new line every 10 to 20 seconds, cut between words, and earlier when the voice changes, so the screen keeps scrolling.
+- `?` means a stretch too short to recognise (under about 2.5 s for a new voice). `B+C` means two voices ended up in one line, which can still happen when people talk over each other.
 - Tested on real voices (a three-person LibriSpeech conversation) and on a real call recording; best with two to four clearly different voices. Similar voices, people talking over each other and very short replies remain hard.
+
+### Testing the speakers branch
+
+Speaker labels are on the `speakers` branch until they have been tested on real calls (it also contains everything from `khmer`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jflaflamme/whispering/speakers/install.sh | WHISPERING_BRANCH=speakers sh
+whispering --speakers
+```
+
+On a checkout: `git fetch && git checkout speakers && ./whispering.py --speakers`. The first run downloads the speaker model (25 MB) and the sherpa-onnx package.
 
 ## Summary at the end of a call
 

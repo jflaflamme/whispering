@@ -20,6 +20,7 @@ import json
 import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -99,6 +100,7 @@ class Screen:
         self.partial = {s: "" for s in streams}
         self.hint = {s: "" for s in streams}
         self.live_who = {s: "" for s in streams}  # live guess of who is speaking (footer only)
+        self.who_now = {}  # stream -> function giving the voices of the line in progress
         self.log = log
         self.drawn = 0
 
@@ -154,7 +156,8 @@ class Screen:
         """On exit, keep any sentence still in progress instead of losing it."""
         for s, text in self.partial.items():
             if text:
-                self.final(s, text + " [cut]")
+                who = self.who_now[s]() if s in self.who_now else None
+                self.final(s, text + " [cut]", who)
 
     def info(self, msg):
         self._clear_footer()
@@ -176,45 +179,66 @@ async def run_stream(name, source, ws_url, screen, gain, turn_detection, speaker
                                           "session": {"turn_detection": turn_detection}}))
 
             # Speaker labels. Lemonade's speech events arrive too late to cut the audio, so
-            # split the other side's audio at short pauses here, label each piece when it
-            # ends, and give a finished line the voice that spoke most since the last line.
+            # split the other side's audio at short pauses here and end Lemonade's line at
+            # the same place (input_audio_buffer.commit): one piece, one line, one voice.
+            # Without the commit, a talk with no 0.8 s pause became one unlabelled line.
             seg = Segmenter(SPEAKER_PAUSE_MS) if speakers else None
             pieces = []  # [stream position at piece end, speech ms, label task]
+            commits = collections.deque()  # stream positions of commits not answered yet
             pos, line_mark = [0], [0]
 
-            async def peek(pcm):
-                screen.who(name, await speakers.label(pcm, peek=True))
+            async def peek(pcm, n):
+                label = await speakers.label(pcm, peek=True)
+                seg.heard(n, label)
+                screen.who(name, label)
 
-            async def line_speaker():
-                since, line_mark[0] = line_mark[0], pos[0]
+            def votes_between(since, until):
                 votes = {}
                 for end, ms, task in pieces:
-                    if end > since:
-                        label = await task
+                    if since < end <= until and task.done():
+                        label = task.result()
                         if label != "?":
                             votes[label] = votes.get(label, 0) + ms
                 if not votes:
                     return "?"
-                total = sum(votes.values())  # a line Lemonade merged from several voices shows all of them
+                total = sum(votes.values())  # a line holding several voices shows all of them
                 return "+".join(sorted(v for v, ms in votes.items() if ms >= 0.3 * total))
+
+            async def line_speaker():
+                since = line_mark[0]
+                line_mark[0] = until = commits.popleft() if commits else pos[0]
+                for end, ms, task in pieces:
+                    if since < end <= until:
+                        await task
+                return votes_between(since, until)
+
+            def who_now():  # a line still open at Ctrl+C: the voices heard so far, or the live guess
+                who = votes_between(line_mark[0], pos[0])
+                return who if who != "?" else screen.live_who[name] or "?"
+
+            if speakers:
+                screen.who_now[name] = who_now
 
             async def send():
                 while chunk := await proc.stdout.readexactly(CHUNK_BYTES):
                     if gain != 1.0:
                         chunk = apply_gain(chunk, gain)
                     pos[0] += len(chunk)
+                    done = None
                     if seg:
                         done, live = seg.feed(chunk)
                         if live:
-                            asyncio.create_task(peek(live))
-                        if done:
-                            pcm, ms = done
-                            pieces.append([pos[0], ms, asyncio.create_task(speakers.label(pcm))])
-                            del pieces[:-50]
+                            asyncio.create_task(peek(live, seg.n))
                     await ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": base64.b64encode(chunk).decode(),
                     }))
+                    if seg and done:
+                        pcm, ms = done
+                        pieces.append([pos[0], ms, asyncio.create_task(speakers.label(pcm))])
+                        del pieces[:-50]
+                        commits.append(pos[0])
+                        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
 
             async def recv():
                 async for raw in ws:
@@ -228,6 +252,8 @@ async def run_stream(name, source, ws_url, screen, gain, turn_detection, speaker
                             screen.final(name, text, await line_speaker() if speakers else None)
                         else:
                             screen.update(name, "")
+                    elif t == "input_audio_buffer.cleared" and commits:
+                        commits.popleft()  # committed between sentences: nothing to transcribe
                     elif t == "error":
                         screen.info(f"{name}: error {ev.get('error', {}).get('message', ev)}")
 
@@ -246,21 +272,30 @@ async def stop_parec(proc):
 
 
 SPEAKER_RMS = 0.01      # loudness that counts as speech when splitting the other side
-SPEAKER_PAUSE_MS = 500  # a pause this long ends a piece (shorter than Lemonade's 0.8 s line end)
+SPEAKER_PAUSE_MS = 600  # a pause this long ends a piece and its line (Lemonade's own end: 0.8 s)
+SPEAKER_SOFT_S = 10     # after this long without a pause, end the piece at the next dip between words
+SPEAKER_MAX_S = 20      # and here at the latest, so long talks keep scrolling
 
 
 class Segmenter:
-    """Splits audio at pauses. feed() returns (finished piece or None, live window or None)."""
+    """Splits audio at pauses. feed() returns (finished piece or None, live window or None).
+
+    Talk with no pause (or over background noise) is cut at a dip between words once the
+    piece is long, or once the live guess says the voice changed (cut_soon), never mid-word.
+    """
 
     def __init__(self, pause_ms):
         self.pause_ms = pause_ms
         self.buf, self.pre = bytearray(), collections.deque(maxlen=3)
         self.on, self.ms, self.quiet, self.peeked = False, 0, 0, 0
+        self.n, self.level, self.cut_soon, self.voice = 0, 0.0, False, ""
 
     def feed(self, chunk):
-        loud = rms(chunk) > SPEAKER_RMS
+        r = rms(chunk)
+        loud = r > SPEAKER_RMS
         if loud and not self.on:
             self.on, self.buf, self.ms, self.peeked = True, bytearray(b"".join(self.pre)), 0, 0
+            self.n, self.level, self.cut_soon, self.voice = self.n + 1, r, False, ""
         if not self.on:
             self.pre.append(chunk)
             return None, None
@@ -270,14 +305,26 @@ class Segmenter:
             self.quiet = 0
         else:
             self.quiet += 100
+        dip = r < 0.5 * self.level
+        self.level = 0.9 * self.level + 0.1 * r
         live = None
         if loud and self.ms >= 1500 and self.ms - self.peeked >= 1500:
             self.peeked = self.ms
             live = bytes(self.buf[-4 * RATE * 2:])
-        if self.quiet >= self.pause_ms or len(self.buf) >= 20 * RATE * 2:
+        long = len(self.buf) >= SPEAKER_SOFT_S * RATE * 2
+        if (self.quiet >= self.pause_ms or ((long or self.cut_soon) and dip)
+                or len(self.buf) >= SPEAKER_MAX_S * RATE * 2):
             self.on = False
             return (bytes(self.buf), self.ms), live
         return None, live
+
+    def heard(self, n, label):
+        """Live guess for piece n: a different confident voice than earlier means cut soon."""
+        if n != self.n or not self.on or label == "?":
+            return
+        if self.voice and label != self.voice and self.ms >= 3000:
+            self.cut_soon = True
+        self.voice = label
 
 
 def config_value(key):
@@ -321,9 +368,16 @@ class Speakers:
             except Exception:
                 return "?"
 
-    def stop(self):
+    async def stop(self):
         if self.proc.returncode is None:
-            self.proc.terminate()
+            try:  # the whole group: `uv run` does not always pass the signal on to python
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        try:
+            await asyncio.wait_for(self.proc.wait(), 2)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
 
 
 def find_khmer_server():
@@ -540,7 +594,6 @@ def main():
         a.speakers or (config_value("speakers") or "").lower() in ("on", "yes", "true", "1"))
     model_dir = os.environ.get("WHISPERING_MODEL_DIR") or config_value("model_dir") \
         or str(Path.home() / ".local/share/whispering/models")
-    helpers = []
 
     async def go():
         speakers = None
@@ -548,7 +601,6 @@ def main():
             screen.info(f"speaker labels on (model in {model_dir}; the first run downloads 25 MB)")
             try:
                 speakers = await Speakers().start(model_dir)
-                helpers.append(speakers)
             except Exception as e:
                 screen.info(f"speaker labels off: {e}")
         tasks = []
@@ -559,7 +611,11 @@ def main():
                 tasks.append(run_stream_km(n, src, km_url, screen, gain, pause, threshold, sp))
             else:
                 tasks.append(run_stream(n, src, ws_url, screen, gain, turn_detection, sp))
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            if speakers:
+                await speakers.stop()
 
     try:
         asyncio.run(go())
@@ -581,8 +637,6 @@ def main():
             log.close()
         if server:
             server.terminate()
-        for h in helpers:
-            h.stop()
         print()
     if log and os.path.getsize(log.name):
         offer_summary(Path(log.name), a.summary)
