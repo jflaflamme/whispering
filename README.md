@@ -97,6 +97,10 @@ whispering --no-spk --speakers        # a meeting room
 
 On a checkout: `git fetch && git checkout speakers && ./whispering.py --speakers`. The first run downloads the speaker model (25 MB) and the sherpa-onnx package.
 
+## Claude Code skill (optional)
+
+If you use Claude Code, the installer offers a skill that lets Claude list your recordings, summarise a call or meeting, rename files by topic, and report or clean up disk use (old audio is only deleted after you confirm). Answer `g` to install it for all your projects (`~/.claude/skills/whispering`), `p` for the current folder only, or `n`. An existing skill is never replaced without asking. Without a terminal (scripts, CI), set `WHISPERING_SKILL=global`, `project` or `no`. The skill's files are in [`skill/whispering`](skill/whispering).
+
 ## Audio next to the transcript
 
 whispering keeps each side's audio next to its transcript, so you can listen back to a passage the transcript got wrong: `2026-10-15_0906.mic.opus` and `.spk.opus`. It is written as WAV during the run (nothing is lost if whispering stops) and compressed to Opus at the end when `ffmpeg` is installed: about 11 MB per hour per side, instead of 115 MB as WAV. A run in which nothing was said keeps no audio. The audio is renamed together with the transcript when the summary gives it a topic name.

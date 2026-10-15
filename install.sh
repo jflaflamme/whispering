@@ -36,6 +36,43 @@ fi
 
 command -v parec >/dev/null 2>&1 || warn "parec not found: sudo apt install pulseaudio-utils"
 
+# Optional Claude Code skill (find, summarise and tidy transcripts). Asked on the terminal,
+# since `curl | sh` uses stdin for this script; WHISPERING_SKILL=global|project|no skips the question.
+ask() {  # ask "question" -> answer on stdout, empty when there is no terminal
+  if (exec </dev/tty) 2>/dev/null; then
+    printf '%s' "$1" >/dev/tty
+    read -r answer </dev/tty || answer=""
+    printf '%s' "$answer"
+  fi
+}
+if [ -d "$HOME/.claude" ] || command -v claude >/dev/null 2>&1; then
+  choice="${WHISPERING_SKILL:-}"
+  if [ -z "$choice" ]; then
+    say ""
+    say "Claude Code skill: lets Claude find, summarise and clean up your transcripts."
+    choice=$(ask "Install it? [g] all projects (~/.claude/skills)  [p] this folder only ($PWD)  [n] no (default): ")
+  fi
+  case "$choice" in
+    g|global) SKILL_DIR="$HOME/.claude/skills/whispering" ;;
+    p|project) SKILL_DIR="$PWD/.claude/skills/whispering" ;;
+    *) SKILL_DIR="" ;;
+  esac
+  if [ -n "$SKILL_DIR" ] && [ -e "$SKILL_DIR/SKILL.md" ]; then
+    case "$(ask "A whispering skill is already in $SKILL_DIR. Replace it? [y/N]: ")" in
+      y|Y|yes) ;;
+      *) say "Kept the existing skill in $SKILL_DIR"; SKILL_DIR="" ;;
+    esac
+  fi
+  if [ -n "$SKILL_DIR" ]; then
+    mkdir -p "$SKILL_DIR/scripts"
+    for f in SKILL.md scripts/sessions.py scripts/housekeeping.py; do
+      curl -fsSL "$REPO_RAW/skill/whispering/$f" -o "$SKILL_DIR/$f"
+    done
+    chmod +x "$SKILL_DIR"/scripts/*.py
+    say "Installed the Claude Code skill in $SKILL_DIR"
+  fi
+fi
+
 if ! command -v lemonade >/dev/null 2>&1; then
   warn "Lemonade is not installed. Install it from the PPA, then run this installer again:"
   say  "    sudo add-apt-repository ppa:lemonade-team/stable"
