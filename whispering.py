@@ -359,9 +359,9 @@ def find_helper(name):
 class Speakers:
     """Talks to speakers.py, which labels pieces of audio by voice: A, B, C."""
 
-    async def start(self, model_dir):
+    async def start(self, model_dir, max_voices=0):
         self.proc = await asyncio.create_subprocess_exec(
-            str(find_helper("speakers.py")), "--model-dir", model_dir,
+            str(find_helper("speakers.py")), "--model-dir", model_dir, "--max-voices", str(max_voices),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
         self.lock, self.n = asyncio.Lock(), 0
@@ -621,6 +621,9 @@ def main():
                    help="label voices A, B, C (local, CPU): the other side of a call, or the mic "
                         "when it is the only side (a meeting room: --no-spk --speakers); "
                         "spk/mic/both to choose; or speakers = ... in the config")
+    p.add_argument("--voices", type=int, default=0, metavar="N",
+                   help="with --speakers: how many people to expect per side (e.g. 2 in a meeting room); "
+                        "never more letters than that")
     p.add_argument("--summary", action="store_true",
                    help="at the end, summarise without asking (local model, see SUMMARY below)")
     p.add_argument("--summary-model", metavar="NAME",
@@ -712,7 +715,7 @@ def main():
             screen.info(f"speaker labels on for {' and '.join(sorted(label_sides))} (model in {model_dir}; the first run downloads 25 MB)")
             try:
                 for n in sorted(label_sides):
-                    speakers[n] = await Speakers().start(model_dir)
+                    speakers[n] = await Speakers().start(model_dir, a.voices)
             except Exception as e:
                 screen.info(f"speaker labels off: {e}")
                 for sp in speakers.values():
