@@ -40,6 +40,9 @@ def main():
                    help="shorter pieces are not fingerprinted at all and get '?'")
     p.add_argument("--new-voice-seconds", type=float, default=2.5,
                    help="only pieces at least this long may start a new voice; shorter ones only match")
+    p.add_argument("--max-voices", type=int, default=0,
+                   help="never more than this many letters (0: no limit); once reached, a voice that "
+                        "matches none goes to the closest one")
     a = p.parse_args()
 
     model = Path(a.model_dir).expanduser() / MODEL
@@ -101,15 +104,17 @@ def main():
                         count[lo] += count[hi]
                         alias[hi] = lo
                         k = lo
-            elif len(pcm) < a.new_voice_seconds * RATE:
+            elif len(pcm) < a.new_voice_seconds * RATE and not (a.max_voices == 1 and voices):
                 print(json.dumps({"id": req["id"], "label": "?", "score": max(sims) if sims else None}), flush=True)
                 continue
-            elif len(voices) < len(LETTERS):
+            elif len(voices) - len(alias) < (a.max_voices or len(LETTERS)) and len(voices) < len(LETTERS):
                 k = len(voices)
                 voices.append(v.copy())
                 count.append(1)
-            else:
-                k = int(np.argmax(sims))
+            else:  # as many voices as expected: the same person in odd conditions (on a real
+                k = int(np.argmax(sims))  # call: background talk made one person a second voice)
+                voices[k] += v
+                count[k] += 1
             label = LETTERS[root(k)]
         print(json.dumps({"id": req["id"], "label": label, "score": score}), flush=True)
 
