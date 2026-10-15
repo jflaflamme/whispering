@@ -83,6 +83,7 @@ whispering --no-spk --speakers     # lines show mic A, mic B, ...
 - Letters are per run: `spk A` today is not `spk A` tomorrow. Names are not detected (yet); the summary can sometimes tell who is who from how people address each other.
 - With labels on, the other side's lines end at shorter pauses (0.6 s instead of 0.8 s), so each line holds one voice. Someone talking for a long time without pausing (or over background music) gets a new line every 10 to 20 seconds, cut between words, and earlier when the voice changes, so the screen keeps scrolling.
 - `?` means a stretch too short to recognise (under about 2.5 s for a new voice). `B+C` means two voices ended up in one line, which can still happen when people talk over each other.
+- On a phone line the same voice varies a lot, so one person can first get two letters. When two letters turn out to be the same voice, whispering merges them from then on and corrects the saved transcript at the end (it prints which letters it merged). A letter heard only once in a long call becomes `?`. The lines already on screen keep the first guess.
 - Tested on real voices (a three-person LibriSpeech conversation) and on a real call recording; best with two to four clearly different voices. Similar voices, people talking over each other and very short replies remain hard.
 
 ### Testing the speakers branch
@@ -103,7 +104,7 @@ If you use Claude Code, the installer offers a skill that lets Claude list your 
 
 ## Audio next to the transcript
 
-whispering keeps each side's audio next to its transcript, so you can listen back to a passage the transcript got wrong: `2026-10-15_0906.mic.opus` and `.spk.opus`. It is written as WAV during the run (nothing is lost if whispering stops) and compressed to Opus at the end when `ffmpeg` is installed: about 11 MB per hour per side, instead of 115 MB as WAV. A run in which nothing was said keeps no audio. The audio is renamed together with the transcript when the summary gives it a topic name.
+whispering keeps each side's audio next to its transcript, so you can listen back to a passage the transcript got wrong: `2026-10-15_0906.mic.opus` and `.spk.opus`. With `ffmpeg` installed it is compressed to Opus while recording (about 11 MB per hour per side, and Ctrl+C stops at once); without ffmpeg it is saved as WAV (115 MB per hour per side). A run in which nothing was said keeps no audio. The audio is renamed together with the transcript when the summary gives it a topic name.
 
 Turn it off with `--no-audio`, or for good with `keep_audio = off` in `~/.config/whispering/config`. Recordings of other people's voices may need their consent where you are.
 
