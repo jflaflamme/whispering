@@ -94,6 +94,7 @@ python3 -I <this skill's folder>/scripts/housekeeping.py --delete-audio --days 9
 whispering                              # a call: your mic + the other side, English (Lemonade Whisper)
 whispering --speakers                   # also label the voices on the other side: spk A, spk B, ...
 whispering --no-spk --speakers          # a meeting room: the laptop mic only, voices labelled mic A, mic B, ...
+whispering --no-spk --speakers --voices 2   # a meeting room with two people: never more than mic A and mic B
 whispering --spk-language km            # you in English, the other side in Khmer
 whispering --language km                # everyone in Khmer
 whispering --mic <source>               # force a mic (see `whispering --list`)
@@ -105,4 +106,4 @@ whispering --summarize FILE...          # summarise existing transcripts with th
 - **Long turns:** without speaker labels, a line ends at a 0.8 s pause, so long unbroken turns become one huge line; the order of points inside it is approximate.
 - **Silence inventions:** without Silero voice detection on the Lemonade server, silence comes back as "Thank you." lines (see the README, "Stop invented text in silence").
 - **Khmer:** Lemonade's Whisper can't do Khmer (it turns it into invented English). Khmer calls need `--language km` or `--spk-language km`; the text is real Khmer but with errors, and English words inside Khmer come out in Khmer letters.
-- **Speaker labels:** quick back-and-forth with no pause can land two people in one line, and one person can get two letters if their voice changes a lot (distance from a room mic, volume).
+- **Speaker labels:** quick back-and-forth with no pause can land two people in one line, and one person can get two letters if their voice changes a lot (distance from a room mic, volume, someone talking near them). whispering merges letters it finds to be the same voice and corrects the transcript at the end; with `--voices N` it never uses more than N letters per side. When a summary depends on who said what, treat a letter that appears only in a short stretch with care: it may be one of the main voices.
