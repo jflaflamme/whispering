@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import wave
 from pathlib import Path
 
 import websockets
@@ -39,6 +40,7 @@ KM_MODEL = "1morecupofhottea/whisper-turbo-khmer-v9"
 KM_PORT = 13399
 KM_MAX_SECONDS = 25  # cut long unbroken speech so the model stays under its 30 s window
 KM_PENDING = []  # (stream, pcm, cut) left over at Ctrl+C, transcribed before exit
+AUDIO = {}  # stream -> wave writer, with --keep-audio
 
 
 OUR_APPS = {"pacat", "parec", "ffmpeg", "python3", "python"}  # our own recorders, not the call
@@ -139,7 +141,7 @@ class Screen:
         self._draw_footer()
 
     def final(self, stream, text, who=None):
-        """who: speaker label for the other side ("A", "B", "?"), shown and saved as "spk A"."""
+        """who: voice label ("A", "B", "?"), shown and saved as "spk A" or "mic A"."""
         self.partial[stream] = ""
         self.live_who[stream] = ""
         self._clear_footer()
@@ -223,6 +225,8 @@ async def run_stream(name, source, ws_url, screen, gain, turn_detection, speaker
                 while chunk := await proc.stdout.readexactly(CHUNK_BYTES):
                     if gain != 1.0:
                         chunk = apply_gain(chunk, gain)
+                    if name in AUDIO:
+                        AUDIO[name].writeframes(chunk)
                     pos[0] += len(chunk)
                     done = None
                     if seg:
@@ -344,7 +348,7 @@ def find_helper(name):
 
 
 class Speakers:
-    """Talks to speakers.py, which labels pieces of the other side's audio A, B, C."""
+    """Talks to speakers.py, which labels pieces of audio by voice: A, B, C."""
 
     async def start(self, model_dir):
         self.proc = await asyncio.create_subprocess_exec(
@@ -459,6 +463,8 @@ async def run_stream_km(name, source, km_url, screen, gain, pause, threshold, sp
         while chunk := await proc.stdout.readexactly(CHUNK_BYTES):
             if gain != 1.0:
                 chunk = apply_gain(chunk, gain)
+            if name in AUDIO:
+                AUDIO[name].writeframes(chunk)
             if rms(chunk) > threshold:
                 if not in_speech:
                     in_speech, buf, speech_ms = True, bytearray(b"".join(preroll)), 0
@@ -505,6 +511,8 @@ def main():
     p.add_argument("-o", "--log", help="append final lines to this file "
                    "(default: ~/transcripts/YYYY-MM-DD_HHMM.txt)")
     p.add_argument("--no-save", action="store_true", help="do not write a transcript file")
+    p.add_argument("--keep-audio", action="store_true",
+                   help="also save each side's audio next to the transcript (<transcript>.mic.wav, .spk.wav)")
     p.add_argument("--mic-gain", type=float, default=1.0, help="multiply mic samples (e.g. 2.0)")
     p.add_argument("--pause", type=float, metavar="SEC",
                    help="silence that ends a line (Lemonade default 0.8)")
@@ -518,8 +526,10 @@ def main():
                    help="language for the other side only (default: --language)")
     p.add_argument("--km-model", default=os.environ.get("WHISPERING_KM_MODEL", KM_MODEL),
                    help="Khmer model id or local path (env WHISPERING_KM_MODEL)")
-    p.add_argument("--speakers", action="store_true",
-                   help="label the voices on the other side spk A, B, C (local, CPU); or speakers = on in the config")
+    p.add_argument("--speakers", nargs="?", const="on", choices=["on", "spk", "mic", "both"],
+                   help="label voices A, B, C (local, CPU): the other side of a call, or the mic "
+                        "when it is the only side (a meeting room: --no-spk --speakers); "
+                        "spk/mic/both to choose; or speakers = ... in the config")
     p.add_argument("--summary", action="store_true",
                    help="at the end, summarise without asking (local model, see SUMMARY below)")
     p.add_argument("--summary-model", metavar="NAME",
@@ -582,6 +592,12 @@ def main():
     screen = Screen(list(streams), log)
     if log:
         screen.info(f"saving to {log.name}")
+        if a.keep_audio:
+            for name in streams:
+                wav = Path(log.name).with_suffix(f".{name}.wav")
+                AUDIO[name] = w = wave.open(str(wav), "wb")
+                w.setnchannels(1), w.setsampwidth(2), w.setframerate(RATE)
+                screen.info(f"keeping the {name} audio: {wav.name}")
     for name, (src, lang) in streams.items():
         engine = f"Khmer model {a.km_model} (local, CPU)" if lang == "km" else f"Lemonade {a.model}"
         auto = f" ({why})" if src == {"mic": mic_default, "spk": spk_default}[name] else ""
@@ -590,23 +606,33 @@ def main():
         screen.info(f"turn detection: {turn_detection}")
     screen.info("Ctrl+C to stop")
 
-    use_speakers = "spk" in streams and (
-        a.speakers or (config_value("speakers") or "").lower() in ("on", "yes", "true", "1"))
+    # Which sides get voice labels. "on": the other side of a call, or the mic when it is
+    # the only side (a mic in the middle of a meeting room). Each side has its own helper and
+    # letters: matching a voice across a room mic and a call line mislabelled people in tests.
+    mode = a.speakers or (config_value("speakers") or "").lower()
+    mode = {"yes": "on", "true": "on", "1": "on"}.get(mode, mode)
+    label_sides = {"on": {"spk"} if "spk" in streams else {"mic"}, "spk": {"spk"},
+                   "mic": {"mic"}, "both": {"mic", "spk"}}.get(mode, set()) & set(streams)
+    use_speakers = bool(label_sides)
     model_dir = os.environ.get("WHISPERING_MODEL_DIR") or config_value("model_dir") \
         or str(Path.home() / ".local/share/whispering/models")
 
     async def go():
-        speakers = None
+        speakers = {}
         if use_speakers:
-            screen.info(f"speaker labels on (model in {model_dir}; the first run downloads 25 MB)")
+            screen.info(f"speaker labels on for {' and '.join(sorted(label_sides))} (model in {model_dir}; the first run downloads 25 MB)")
             try:
-                speakers = await Speakers().start(model_dir)
+                for n in sorted(label_sides):
+                    speakers[n] = await Speakers().start(model_dir)
             except Exception as e:
                 screen.info(f"speaker labels off: {e}")
+                for sp in speakers.values():
+                    await sp.stop()
+                speakers = {}
         tasks = []
         for n, (src, lang) in streams.items():
             gain = a.mic_gain if n == "mic" else 1.0
-            sp = speakers if n == "spk" else None
+            sp = speakers.get(n)
             if lang == "km":
                 tasks.append(run_stream_km(n, src, km_url, screen, gain, pause, threshold, sp))
             else:
@@ -614,8 +640,8 @@ def main():
         try:
             await asyncio.gather(*tasks)
         finally:
-            if speakers:
-                await speakers.stop()
+            for sp in speakers.values():
+                await sp.stop()
 
     try:
         asyncio.run(go())
@@ -635,6 +661,8 @@ def main():
                 screen.final(name, text + (" [cut]" if cut else ""))
         if log:
             log.close()
+        for w in AUDIO.values():
+            w.close()
         if server:
             server.terminate()
         print()
@@ -654,7 +682,7 @@ SAME_CALL_GAP_MIN = 20  # an earlier file ending this close is part of the same 
 NAME = __import__("re").compile(r"^(\d{4}-\d\d-\d\d)_(\d{4})(?:_[a-z0-9-]+)?\.txt$")
 
 SUMMARY_PROMPT = """You summarise a call transcript recorded by a live transcriber.
-Each line is "HH:MM:SS [mic|spk] text". [mic] is the user. [spk] is everyone on the other side of the call. When speaker labels are on, [spk A], [spk B] … tell apart voices on the other side ("?" = unknown, "B+C" = several voices in one line); letters are not names, and a name in the text (someone addressed by name) is the only way to know who a letter is.
+Each line is "HH:MM:SS [mic|spk] text". [mic] is the user's microphone. [spk] is everyone on the other side of the call. When speaker labels are on, [spk A], [spk B] … (or [mic A], [mic B] … when the microphone sits in a meeting room) tell voices apart ("?" = unknown, "B+C" = several voices in one line); each side has its own letters, so [mic A] and [spk A] are different people. Letters are not names, and a name in the text (someone addressed by name) is the only way to know who a letter is.
 
 Write the summary in English Markdown with exactly these sections:
 
@@ -811,6 +839,10 @@ def summarize(files):
         if mm and f.name == f"{mm.group(1)}_{mm.group(2)}.txt":
             new = f.with_name(f"{mm.group(1)}_{mm.group(2)}_{slug}.txt")
             if not new.exists():
+                for side in ("mic", "spk"):  # audio kept with --keep-audio follows its transcript
+                    wav = f.with_suffix(f".{side}.wav")
+                    if wav.exists() and not new.with_suffix(f".{side}.wav").exists():
+                        wav.rename(new.with_suffix(f".{side}.wav"))
                 f.rename(new)
                 f = new
         renamed.append(f)

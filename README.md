@@ -71,11 +71,20 @@ With `--speakers` (or `speakers = on` in `~/.config/whispering/config`), lines f
 
 While someone is talking, the grey line at the bottom already shows a live guess (`spk B…`), checked every 1.5 seconds.
 
+**In a meeting room** (the laptop's mic in the middle of the table, no call), record the mic only and label it:
+
+```sh
+whispering --no-spk --speakers     # lines show mic A, mic B, ...
+```
+
+`--speakers` labels the other side of a call, or the mic when it is the only side. `--speakers mic`, `spk` or `both` chooses explicitly (for a room that is also on a call, `both`). Each side has its own letters: `mic A` and `spk A` are different people. A room mic hears people at different distances, so quiet or far voices may need `--mic-gain`.
+
 - A small helper, `speakers.py`, computes a voiceprint for each stretch of speech with the 3D-Speaker ERes2Net model through [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx), on the CPU. Voices are grouped as they come: no names and nothing leaves the laptop. The model (25 MB) downloads on first use to `~/.local/share/whispering/models`, or to `model_dir` from the config (or `WHISPERING_MODEL_DIR`).
 - Letters are per run: `spk A` today is not `spk A` tomorrow. Names are not detected (yet); the summary can sometimes tell who is who from how people address each other.
 - With labels on, the other side's lines end at shorter pauses (0.6 s instead of 0.8 s), so each line holds one voice. Someone talking for a long time without pausing (or over background music) gets a new line every 10 to 20 seconds, cut between words, and earlier when the voice changes, so the screen keeps scrolling.
 - `?` means a stretch too short to recognise (under about 2.5 s for a new voice). `B+C` means two voices ended up in one line, which can still happen when people talk over each other.
 - Tested on real voices (a three-person LibriSpeech conversation) and on a real call recording; best with two to four clearly different voices. Similar voices, people talking over each other and very short replies remain hard.
+- `--keep-audio` also saves each side's audio next to the transcript (`2026-10-15_0906.mic.wav`, `.spk.wav`, about 115 MB per hour per side). Off by default; useful to report a wrong label, since the audio shows what the model heard.
 
 ### Testing the speakers branch
 
@@ -83,7 +92,8 @@ Speaker labels are on the `speakers` branch until they have been tested on real 
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/jflaflamme/whispering/speakers/install.sh | WHISPERING_BRANCH=speakers sh
-whispering --speakers
+whispering --speakers                 # a call
+whispering --no-spk --speakers        # a meeting room
 ```
 
 On a checkout: `git fetch && git checkout speakers && ./whispering.py --speakers`. The first run downloads the speaker model (25 MB) and the sherpa-onnx package.
